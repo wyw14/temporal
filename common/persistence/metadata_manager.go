@@ -103,6 +103,14 @@ func (m *metadataManagerImpl) RenameNamespace(
 		Name: request.PreviousName,
 	})
 	if err != nil {
+		// The rename is driven by an at-least-once activity, so a previous attempt may have committed
+		// before its response was lost. If the record already exists under the new name, the rename
+		// is complete and the retry must not perform a second conditional write.
+		if _, ok := err.(*serviceerror.NamespaceNotFound); ok && request.NewName != request.PreviousName {
+			if renamed, renamedErr := m.GetNamespace(ctx, &GetNamespaceRequest{Name: request.NewName}); renamedErr == nil && renamed != nil {
+				return nil
+			}
+		}
 		return err
 	}
 

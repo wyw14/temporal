@@ -3,6 +3,7 @@ package frontend
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"slices"
 	"testing"
 	"time"
@@ -52,6 +53,7 @@ type (
 		mockClusterMetadata     *cluster.MockMetadata
 		mockProducer            *persistence.MockNamespaceReplicationQueue
 		mockNamespaceReplicator nsreplication.Replicator
+		mockNamespaceRegistry   *namespace.MockRegistry
 		archivalMetadata        archiver.ArchivalMetadata
 		mockArchiverProvider    *provider.MockArchiverProvider
 		fakeClock               *clock.EventTimeSource
@@ -106,13 +108,14 @@ func (s *namespaceHandlerCommonSuite) SetupTest() {
 		&config.ArchivalNamespaceDefaults{},
 	)
 	s.mockArchiverProvider = provider.NewMockArchiverProvider(s.controller)
+	s.mockNamespaceRegistry = namespace.NewMockRegistry(s.controller)
 	s.fakeClock = clock.NewEventTimeSource()
 	s.config = NewConfig(dc.NewNoopCollection(), 1024)
 	s.handler = newNamespaceHandler(
 		logger,
 		wideevents.NoopLogger(),
 		s.mockMetadataMgr,
-		namespace.NewMockRegistry(s.controller),
+		s.mockNamespaceRegistry,
 		s.mockClusterMetadata,
 		s.mockNamespaceReplicator,
 		s.archivalMetadata,
@@ -332,6 +335,7 @@ func (s *namespaceHandlerCommonSuite) TestUpdateNamespacePersistsRampOnlyOnSourc
 			return nil
 		},
 	)
+	s.mockNamespaceRegistry.EXPECT().RefreshNamespaceById(namespace.ID(detail.Info.Id)).Return(nil, nil)
 
 	response, err := s.handler.UpdateNamespace(context.Background(), &workflowservice.UpdateNamespaceRequest{
 		Namespace: namespaceName,
@@ -382,6 +386,7 @@ func (s *namespaceHandlerCommonSuite) TestDeprecateNamespaceEventUsesPersistedAf
 			return nil
 		},
 	)
+	s.mockNamespaceRegistry.EXPECT().RefreshNamespaceById(namespace.ID("namespace-id")).Return(nil, nil)
 
 	_, err := s.handler.DeprecateNamespace(context.Background(), &workflowservice.DeprecateNamespaceRequest{Namespace: "namespace"})
 	s.Require().NoError(err)
@@ -915,6 +920,181 @@ func (s *namespaceHandlerCommonSuite) TestUpdateNamespace_InvalidRetentionPeriod
 	}
 }
 
+func (s *namespaceHandlerCommonSuite) TestUpdateNamespace_DeletedNamespaceRejectsMutation() {
+	nsName := "deleted-ns"
+	nsID := uuid.NewString()
+	s.mockMetadataMgr.EXPECT().GetMetadata(gomock.Any()).Return(&persistence.GetMetadataResponse{
+		NotificationVersion: 100,
+	}, nil)
+	s.mockMetadataMgr.EXPECT().GetNamespace(gomock.Any(), gomock.Any()).Return(&persistence.GetNamespaceResponse{
+		Namespace: &persistencespb.NamespaceDetail{
+			Info: &persistencespb.NamespaceInfo{
+				Id:    nsID,
+				Name:  nsName,
+				State: enumspb.NAMESPACE_STATE_DELETED,
+			},
+			Config: &persistencespb.NamespaceConfig{
+				Retention:   durationpb.New(7 * 24 * time.Hour),
+				BadBinaries: &namespacepb.BadBinaries{Binaries: map[string]*namespacepb.BadBinaryInfo{}},
+			},
+			ReplicationConfig: &persistencespb.NamespaceReplicationConfig{
+				ActiveClusterName: cluster.TestCurrentClusterName,
+				Clusters:          []string{cluster.TestCurrentClusterName},
+			},
+		},
+	}, nil)
+	s.mockClusterMetadata.EXPECT().GetAllClusterInfo().Return(map[string]cluster.ClusterInformation{
+		cluster.TestCurrentClusterName: {Enabled: true},
+	}).AnyTimes()
+	s.mockClusterMetadata.EXPECT().GetCurrentClusterName().Return(cluster.TestCurrentClusterName).AnyTimes()
+	s.mockMetadataMgr.EXPECT().UpdateNamespace(gomock.Any(), gomock.Any()).Times(0)
+
+	_, err := s.handler.UpdateNamespace(context.Background(), &workflowservice.UpdateNamespaceRequest{
+		Namespace: nsName,
+		Config: &namespacepb.NamespaceConfig{
+			WorkflowExecutionRetentionTtl: durationpb.New(8 * 24 * time.Hour),
+		},
+	})
+	var failedPrecondition *serviceerror.FailedPrecondition
+	s.Require().ErrorAs(err, &failedPrecondition)
+}
+
+func (s *namespaceHandlerCommonSuite) TestUpdateNamespace_DeletedNamespaceDuplicateStateRequestIsNoOp() {
+	nsName := "deleted-ns"
+	s.mockMetadataMgr.EXPECT().GetMetadata(gomock.Any()).Return(&persistence.GetMetadataResponse{
+		NotificationVersion: 100,
+	}, nil)
+	s.mockMetadataMgr.EXPECT().GetNamespace(gomock.Any(), gomock.Any()).Return(&persistence.GetNamespaceResponse{
+		Namespace: &persistencespb.NamespaceDetail{
+			Info: &persistencespb.NamespaceInfo{
+				Id:    uuid.NewString(),
+				Name:  nsName,
+				State: enumspb.NAMESPACE_STATE_DELETED,
+			},
+			Config: &persistencespb.NamespaceConfig{
+				BadBinaries: &namespacepb.BadBinaries{Binaries: map[string]*namespacepb.BadBinaryInfo{}},
+			},
+			ReplicationConfig: &persistencespb.NamespaceReplicationConfig{
+				ActiveClusterName: cluster.TestCurrentClusterName,
+				Clusters:          []string{cluster.TestCurrentClusterName},
+			},
+		},
+	}, nil)
+	s.mockClusterMetadata.EXPECT().GetAllClusterInfo().Return(map[string]cluster.ClusterInformation{
+		cluster.TestCurrentClusterName: {Enabled: true},
+	}).AnyTimes()
+	s.mockClusterMetadata.EXPECT().GetCurrentClusterName().Return(cluster.TestCurrentClusterName).AnyTimes()
+	s.mockMetadataMgr.EXPECT().UpdateNamespace(gomock.Any(), gomock.Any()).Times(0)
+
+	resp, err := s.handler.UpdateNamespace(context.Background(), &workflowservice.UpdateNamespaceRequest{
+		Namespace: nsName,
+		UpdateInfo: &namespacepb.UpdateNamespaceInfo{
+			State: enumspb.NAMESPACE_STATE_DELETED,
+		},
+	})
+	s.Require().NoError(err)
+	s.NotNil(resp)
+}
+
+func (s *namespaceHandlerCommonSuite) TestUpdateNamespace_RefreshesRegistryAfterCommit() {
+	nsName := "registered-ns"
+	nsID := uuid.NewString()
+	s.mockMetadataMgr.EXPECT().GetMetadata(gomock.Any()).Return(&persistence.GetMetadataResponse{
+		NotificationVersion: 100,
+	}, nil)
+	s.mockMetadataMgr.EXPECT().GetNamespace(gomock.Any(), gomock.Any()).Return(&persistence.GetNamespaceResponse{
+		Namespace: &persistencespb.NamespaceDetail{
+			Info: &persistencespb.NamespaceInfo{
+				Id:   nsID,
+				Name: nsName,
+			},
+			Config: &persistencespb.NamespaceConfig{
+				Retention:   durationpb.New(7 * 24 * time.Hour),
+				BadBinaries: &namespacepb.BadBinaries{Binaries: map[string]*namespacepb.BadBinaryInfo{}},
+			},
+			ReplicationConfig: &persistencespb.NamespaceReplicationConfig{
+				ActiveClusterName: cluster.TestCurrentClusterName,
+				Clusters:          []string{cluster.TestCurrentClusterName},
+			},
+		},
+	}, nil)
+	s.mockClusterMetadata.EXPECT().GetAllClusterInfo().Return(map[string]cluster.ClusterInformation{
+		cluster.TestCurrentClusterName: {Enabled: true},
+	}).AnyTimes()
+	s.mockClusterMetadata.EXPECT().GetCurrentClusterName().Return(cluster.TestCurrentClusterName).AnyTimes()
+	s.mockMetadataMgr.EXPECT().UpdateNamespace(gomock.Any(), gomock.Any()).Return(nil)
+	s.mockNamespaceRegistry.EXPECT().RefreshNamespaceById(namespace.ID(nsID)).Return(nil, nil).Times(1)
+
+	_, err := s.handler.UpdateNamespace(context.Background(), &workflowservice.UpdateNamespaceRequest{
+		Namespace: nsName,
+		Config: &namespacepb.NamespaceConfig{
+			WorkflowExecutionRetentionTtl: durationpb.New(8 * 24 * time.Hour),
+		},
+	})
+	s.Require().NoError(err)
+}
+
+func (s *namespaceHandlerCommonSuite) TestUpdateNamespace_FailedWriteDoesNotRefreshRegistry() {
+	nsName := "registered-ns"
+	s.mockMetadataMgr.EXPECT().GetMetadata(gomock.Any()).Return(&persistence.GetMetadataResponse{
+		NotificationVersion: 100,
+	}, nil)
+	s.mockMetadataMgr.EXPECT().GetNamespace(gomock.Any(), gomock.Any()).Return(&persistence.GetNamespaceResponse{
+		Namespace: &persistencespb.NamespaceDetail{
+			Info: &persistencespb.NamespaceInfo{
+				Id:   uuid.NewString(),
+				Name: nsName,
+			},
+			Config: &persistencespb.NamespaceConfig{
+				Retention:   durationpb.New(7 * 24 * time.Hour),
+				BadBinaries: &namespacepb.BadBinaries{Binaries: map[string]*namespacepb.BadBinaryInfo{}},
+			},
+			ReplicationConfig: &persistencespb.NamespaceReplicationConfig{
+				ActiveClusterName: cluster.TestCurrentClusterName,
+				Clusters:          []string{cluster.TestCurrentClusterName},
+			},
+		},
+	}, nil)
+	s.mockClusterMetadata.EXPECT().GetAllClusterInfo().Return(map[string]cluster.ClusterInformation{
+		cluster.TestCurrentClusterName: {Enabled: true},
+	}).AnyTimes()
+	s.mockClusterMetadata.EXPECT().GetCurrentClusterName().Return(cluster.TestCurrentClusterName).AnyTimes()
+	s.mockMetadataMgr.EXPECT().UpdateNamespace(gomock.Any(), gomock.Any()).Return(errors.New("conditional update error"))
+
+	_, err := s.handler.UpdateNamespace(context.Background(), &workflowservice.UpdateNamespaceRequest{
+		Namespace: nsName,
+		Config: &namespacepb.NamespaceConfig{
+			WorkflowExecutionRetentionTtl: durationpb.New(8 * 24 * time.Hour),
+		},
+	})
+	s.Require().Error(err)
+}
+
+func (s *namespaceHandlerCommonSuite) TestDeprecateNamespace_DeletedNamespaceRejected() {
+	s.mockClusterMetadata.EXPECT().IsGlobalNamespaceEnabled().Return(false)
+	s.mockMetadataMgr.EXPECT().GetMetadata(gomock.Any()).Return(&persistence.GetMetadataResponse{
+		NotificationVersion: 100,
+	}, nil)
+	s.mockMetadataMgr.EXPECT().GetNamespace(gomock.Any(), gomock.Any()).Return(&persistence.GetNamespaceResponse{
+		Namespace: &persistencespb.NamespaceDetail{
+			Info: &persistencespb.NamespaceInfo{
+				Id:    uuid.NewString(),
+				Name:  "deleted-ns",
+				State: enumspb.NAMESPACE_STATE_DELETED,
+			},
+			Config:            &persistencespb.NamespaceConfig{},
+			ReplicationConfig: &persistencespb.NamespaceReplicationConfig{},
+		},
+	}, nil)
+	s.mockMetadataMgr.EXPECT().UpdateNamespace(gomock.Any(), gomock.Any()).Times(0)
+
+	_, err := s.handler.DeprecateNamespace(context.Background(), &workflowservice.DeprecateNamespaceRequest{
+		Namespace: "deleted-ns",
+	})
+	var failedPrecondition *serviceerror.FailedPrecondition
+	s.Require().ErrorAs(err, &failedPrecondition)
+}
+
 func (s *namespaceHandlerCommonSuite) TestUpdateNamespace_PromoteLocalNamespace() {
 	namespace := "local-ns-to-be-promoted"
 	clusterName := "cluster1"
@@ -964,6 +1144,7 @@ func (s *namespaceHandlerCommonSuite) TestUpdateNamespace_PromoteLocalNamespace(
 	}).AnyTimes()
 	s.mockClusterMetadata.EXPECT().GetCurrentClusterName().Return(clusterName).AnyTimes()
 	s.mockClusterMetadata.EXPECT().GetNextFailoverVersion(clusterName, int64(0)).Return(int64(2))
+	s.mockNamespaceRegistry.EXPECT().RefreshNamespaceById(gomock.Any()).Return(nil, nil)
 
 	updateRequest := &workflowservice.UpdateNamespaceRequest{
 		Namespace:        namespace,
@@ -1046,6 +1227,7 @@ func (s *namespaceHandlerCommonSuite) TestUpdateNamespace_UpdateActiveClusterWit
 		IsGlobalNamespace:   true,
 		NotificationVersion: version,
 	}))
+	s.mockNamespaceRegistry.EXPECT().RefreshNamespaceById(gomock.Any()).Return(nil, nil)
 	s.fakeClock.Update(update1Time)
 	updateRequest := &workflowservice.UpdateNamespaceRequest{
 		Namespace: namespace,
@@ -1121,6 +1303,7 @@ func (s *namespaceHandlerCommonSuite) TestUpdateNamespace_ChangeActiveClusterWit
 		IsGlobalNamespace:   true,
 		NotificationVersion: version,
 	})
+	s.mockNamespaceRegistry.EXPECT().RefreshNamespaceById(gomock.Any()).Return(nil, nil)
 	s.fakeClock.Update(update1Time)
 	updateRequest := &workflowservice.UpdateNamespaceRequest{
 		Namespace: namespace,
@@ -1228,6 +1411,7 @@ func (s *namespaceHandlerCommonSuite) TestUpdateNamespace_UpdateActiveCluster_Li
 		IsGlobalNamespace:   true,
 		NotificationVersion: version,
 	})
+	s.mockNamespaceRegistry.EXPECT().RefreshNamespaceById(gomock.Any()).Return(nil, nil)
 	s.fakeClock.Update(update1Time)
 	_, err := s.handler.UpdateNamespace(context.Background(), updateRequest)
 	s.NoError(err)
@@ -1457,6 +1641,7 @@ func (s *namespaceHandlerCommonSuite) TestUpdateLocalNamespace_AllAttrSet() {
 	data := map[string]string{"some random key": "some random value"}
 	version := int64(100)
 	nid := uuid.NewString()
+	s.mockNamespaceRegistry.EXPECT().RefreshNamespaceById(gomock.Any()).Return(nil, nil)
 	s.mockMetadataMgr.EXPECT().GetMetadata(gomock.Any()).Return(&persistence.GetMetadataResponse{
 		NotificationVersion: version,
 	}, nil)
@@ -1692,6 +1877,7 @@ func (s *namespaceHandlerCommonSuite) TestUpdateGlobalNamespace_AllAttrSet() {
 	data := map[string]string{"some random key": "some random value"}
 	version := int64(100)
 	nid := uuid.NewString()
+	s.mockNamespaceRegistry.EXPECT().RefreshNamespaceById(gomock.Any()).Return(nil, nil)
 	s.mockMetadataMgr.EXPECT().GetMetadata(gomock.Any()).Return(&persistence.GetMetadataResponse{
 		NotificationVersion: version,
 	}, nil)
@@ -1808,6 +1994,7 @@ func (s *namespaceHandlerCommonSuite) TestUpdateLocalNamespace_NotMaster() {
 	data := map[string]string{"some random key": "some random value"}
 	version := int64(100)
 	nid := uuid.NewString()
+	s.mockNamespaceRegistry.EXPECT().RefreshNamespaceById(gomock.Any()).Return(nil, nil)
 	s.mockMetadataMgr.EXPECT().GetMetadata(gomock.Any()).Return(&persistence.GetMetadataResponse{
 		NotificationVersion: version,
 	}, nil)
@@ -1902,6 +2089,7 @@ func (s *namespaceHandlerCommonSuite) TestUpdateGlobalNamespace_NotMaster() {
 	data := map[string]string{"some random key": "some random value"}
 	version := int64(100)
 	nid := uuid.NewString()
+	s.mockNamespaceRegistry.EXPECT().RefreshNamespaceById(gomock.Any()).Return(nil, nil)
 	s.mockMetadataMgr.EXPECT().GetMetadata(gomock.Any()).Return(&persistence.GetMetadataResponse{
 		NotificationVersion: version,
 	}, nil)
@@ -1978,6 +2166,7 @@ func (s *namespaceHandlerCommonSuite) TestFailoverGlobalNamespace_NotMaster() {
 	update1Time := time.Date(2011, 12, 27, 23, 44, 55, 999999, time.UTC)
 	namespace := "global-ns-to-be-migrated"
 	nid := uuid.NewString()
+	s.mockNamespaceRegistry.EXPECT().RefreshNamespaceById(gomock.Any()).Return(nil, nil)
 	version := int64(100)
 	clusterName1 := "cluster1"
 	clusterName2 := "cluster2"

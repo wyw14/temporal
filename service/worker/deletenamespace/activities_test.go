@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/temporal"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
@@ -58,6 +59,63 @@ func Test_GetNamespaceInfoActivityUsesReplicationResolver(t *testing.T) {
 		CurrentCluster:              "current-cluster",
 		CanDeleteFromCurrentCluster: true,
 	}, result)
+}
+
+func Test_MarkNamespaceDeletedActivity_IdempotentWhenAlreadyDeleted(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	metadataManager := persistence.NewMockMetadataManager(ctrl)
+	detail := &persistencespb.NamespaceDetail{
+		Info: &persistencespb.NamespaceInfo{
+			Id:    "namespace-id",
+			Name:  "namespace",
+			State: enumspb.NAMESPACE_STATE_DELETED,
+		},
+	}
+
+	metadataManager.EXPECT().GetNamespace(gomock.Any(), &persistence.GetNamespaceRequest{
+		Name: "namespace",
+	}).Return(&persistence.GetNamespaceResponse{Namespace: detail}, nil)
+
+	a := &localActivities{
+		metadataManager: metadataManager,
+		logger:          log.NewTestLogger(),
+	}
+
+	require.NoError(t, a.MarkNamespaceDeletedActivity(context.Background(), "namespace"))
+}
+
+func Test_MarkNamespaceDeletedActivity_MarksRegisteredNamespaceDeleted(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	metadataManager := persistence.NewMockMetadataManager(ctrl)
+	detail := &persistencespb.NamespaceDetail{
+		Info: &persistencespb.NamespaceInfo{
+			Id:    "namespace-id",
+			Name:  "namespace",
+			State: enumspb.NAMESPACE_STATE_REGISTERED,
+		},
+		ReplicationConfig: &persistencespb.NamespaceReplicationConfig{},
+	}
+
+	metadataManager.EXPECT().GetNamespace(gomock.Any(), &persistence.GetNamespaceRequest{
+		Name: "namespace",
+	}).Return(&persistence.GetNamespaceResponse{Namespace: detail}, nil)
+	metadataManager.EXPECT().GetMetadata(gomock.Any()).Return(&persistence.GetMetadataResponse{
+		NotificationVersion: 10,
+	}, nil)
+	metadataManager.EXPECT().UpdateNamespace(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, request *persistence.UpdateNamespaceRequest) error {
+			require.Equal(t, enumspb.NAMESPACE_STATE_DELETED, request.Namespace.Info.State)
+			require.Equal(t, int64(10), request.NotificationVersion)
+			return nil
+		},
+	)
+
+	a := &localActivities{
+		metadataManager: metadataManager,
+		logger:          log.NewTestLogger(),
+	}
+
+	require.NoError(t, a.MarkNamespaceDeletedActivity(context.Background(), "namespace"))
 }
 
 func Test_GenerateDeletedNamespaceNameActivity(t *testing.T) {

@@ -64,6 +64,7 @@ var (
 	errCannotDoNamespaceFailoverAndUpdate = serviceerror.NewInvalidArgument("Cannot set active cluster to current cluster when other parameters are set.")
 	errInvalidRetentionPeriod             = serviceerror.NewInvalidArgument("A valid retention period is not set on request.")
 	errInvalidNamespaceStateUpdate        = serviceerror.NewInvalidArgument("Invalid namespace state update.")
+	errCannotUpdateDeletedNamespace       = serviceerror.NewFailedPrecondition("Namespace is deleted and cannot be updated.")
 
 	errCustomSearchAttributeFieldAlreadyAllocated = serviceerror.NewInvalidArgument("Custom search attribute field name already allocated.")
 )
@@ -417,6 +418,7 @@ func (d *namespaceHandler) UpdateNamespace(
 	// Snapshot pre-mutation namespace fields for the namespace_updated wide event emitted on success
 	// below; the after-snapshot is taken from the persisted record once the mutations complete.
 	eventBefore := namespaceStateFields(getResponse.Namespace, getResponse.IsGlobalNamespace)
+	existingState := getResponse.Namespace.Info.State
 
 	currentHistoryArchivalState := &namespace.ArchivalConfigState{
 		State: config.HistoryArchivalState,
@@ -606,6 +608,15 @@ func (d *namespaceHandler) UpdateNamespace(
 		}
 	}
 
+	// A namespace in the deleted state is being torn down by the delete namespace workflow and must
+	// not receive config, retention, or replication changes, which would leave inconsistent state
+	// behind and race the rename and resource reclamation steps. Requests that change nothing, such
+	// as retried delete-state requests, remain idempotent no-ops.
+	if existingState == enumspb.NAMESPACE_STATE_DELETED &&
+		(configurationChanged || activeClusterChanged || needsNamespacePromotion) {
+		return nil, errCannotUpdateDeletedNamespace
+	}
+
 	if configurationChanged && activeClusterChanged && isGlobalNamespace {
 		return nil, errCannotDoNamespaceFailoverAndUpdate
 	} else if configurationChanged || activeClusterChanged || needsNamespacePromotion {
@@ -648,6 +659,17 @@ func (d *namespaceHandler) UpdateNamespace(
 		err = d.metadataMgr.UpdateNamespace(ctx, updateReq)
 		if err != nil {
 			return nil, err
+		}
+
+		// Refresh the local cache only after the transaction commits so a failed update never
+		// exposes a half-written config, including retention and custom search attribute aliases used
+		// by visibility queries. Other nodes converge through namespace watch events or polling. A
+		// refresh failure does not fail the committed update; the next refresh converges.
+		if _, refreshErr := d.namespaceRegistry.RefreshNamespaceById(namespace.ID(info.Id)); refreshErr != nil {
+			d.logger.Warn("Failed to refresh namespace after update",
+				tag.WorkflowNamespace(info.Name),
+				tag.Error(refreshErr),
+			)
 		}
 
 		d.emitNamespaceUpdated(buildNamespaceUpdatedInput(
@@ -818,6 +840,10 @@ func (d *namespaceHandler) DeprecateNamespace(
 		return nil, err
 	}
 
+	if getResponse.Namespace.Info.State == enumspb.NAMESPACE_STATE_DELETED {
+		return nil, errCannotUpdateDeletedNamespace
+	}
+
 	eventBefore := namespaceStateFields(getResponse.Namespace, getResponse.IsGlobalNamespace)
 
 	getResponse.Namespace.ConfigVersion = getResponse.Namespace.ConfigVersion + 1
@@ -837,6 +863,15 @@ func (d *namespaceHandler) DeprecateNamespace(
 	err = d.metadataMgr.UpdateNamespace(ctx, updateReq)
 	if err != nil {
 		return nil, err
+	}
+
+	if _, refreshErr := d.namespaceRegistry.RefreshNamespaceById(
+		namespace.ID(getResponse.Namespace.Info.Id),
+	); refreshErr != nil {
+		d.logger.Warn("Failed to refresh namespace after deprecation",
+			tag.WorkflowNamespace(getResponse.Namespace.Info.Name),
+			tag.Error(refreshErr),
+		)
 	}
 
 	d.emitNamespaceUpdated(buildNamespaceUpdatedInput(

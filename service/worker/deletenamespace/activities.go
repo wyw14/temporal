@@ -154,15 +154,23 @@ func (a *localActivities) MarkNamespaceDeletedActivity(ctx context.Context, nsNa
 		Name: nsName.String(),
 	}
 
-	metadata, err := a.metadataManager.GetMetadata(ctx)
-	if err != nil {
-		a.logger.Error("Unable to get cluster metadata.", tag.WorkflowNamespace(nsName.String()), tag.Error(err))
-		return err
-	}
-
 	ns, err := a.metadataManager.GetNamespace(ctx, getNamespaceRequest)
 	if err != nil {
 		a.logger.Error("Unable to get namespace details.", tag.WorkflowNamespace(nsName.String()), tag.Error(err))
+		return err
+	}
+
+	// This activity is retried at least once and can be invoked by a duplicate delete workflow run.
+	// Treat the already-deleted state as success without another conditional write so retries neither
+	// bump the notification version nor fail on stale notification versions.
+	if ns.Namespace.Info.State == enumspb.NAMESPACE_STATE_DELETED {
+		a.logger.Info("Namespace already marked as deleted.", tag.WorkflowNamespace(nsName.String()))
+		return nil
+	}
+
+	metadata, err := a.metadataManager.GetMetadata(ctx)
+	if err != nil {
+		a.logger.Error("Unable to get cluster metadata.", tag.WorkflowNamespace(nsName.String()), tag.Error(err))
 		return err
 	}
 

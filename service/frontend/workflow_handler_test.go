@@ -1742,6 +1742,7 @@ func (s *WorkflowHandlerSuite) TestDeprecateNamespace_Success() {
 			return nil
 		},
 	)
+	s.mockNamespaceCache.EXPECT().RefreshNamespaceById(gomock.Any()).Return(nil, nil)
 
 	wh := s.getWorkflowHandler(s.newConfig())
 
@@ -1838,6 +1839,7 @@ func (s *WorkflowHandlerSuite) TestDeleteNamespace_Success() {
 			return nil
 		},
 	)
+	s.mockNamespaceCache.EXPECT().RefreshNamespaceById(gomock.Any()).Return(nil, nil)
 
 	wh := s.getWorkflowHandler(s.newConfig())
 
@@ -2107,6 +2109,7 @@ func (s *WorkflowHandlerSuite) TestUpdateNamespace_Success_ArchivalEnabledToArch
 
 	wh := s.getWorkflowHandler(s.newConfig())
 
+	s.mockNamespaceCache.EXPECT().RefreshNamespaceById(gomock.Any()).Return(nil, nil)
 	updateReq := updateRequest(
 		"",
 		enumspb.ARCHIVAL_STATE_DISABLED,
@@ -2171,6 +2174,7 @@ func (s *WorkflowHandlerSuite) TestUpdateNamespace_Success_ArchivalEnabledToArch
 
 	wh := s.getWorkflowHandler(s.newConfig())
 
+	s.mockNamespaceCache.EXPECT().RefreshNamespaceById(gomock.Any()).Return(nil, nil)
 	updateReq := updateRequest(
 		testHistoryArchivalURI,
 		enumspb.ARCHIVAL_STATE_DISABLED,
@@ -2244,6 +2248,7 @@ func (s *WorkflowHandlerSuite) TestUpdateNamespace_Success_ArchivalNeverEnabledT
 
 	wh := s.getWorkflowHandler(s.newConfig())
 
+	s.mockNamespaceCache.EXPECT().RefreshNamespaceById(gomock.Any()).Return(nil, nil)
 	updateReq := updateRequest(
 		testHistoryArchivalURI,
 		enumspb.ARCHIVAL_STATE_ENABLED,
