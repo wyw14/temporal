@@ -865,6 +865,130 @@ func (s *stateBuilderSuite) TestApplyEvents_EventTypeWorkflowExecutionContinuedA
 	s.Equal(continueAsNewEvent.TaskId, s.executionInfo.LastRunningClock)
 }
 
+// TestApplyEvents_EmptyHistory verifies that a partial history read (no persistence batches) fails
+// the rebuild with an error instead of panicking on history[-1].
+func (s *stateBuilderSuite) TestApplyEvents_EmptyHistory() {
+	_, err := s.stateRebuilder.ApplyEvents(
+		context.Background(),
+		tests.NamespaceID,
+		uuid.NewString(),
+		&commonpb.WorkflowExecution{WorkflowId: "some random workflow ID", RunId: tests.RunID},
+		nil,
+		nil,
+		"",
+	)
+	s.Error(err)
+	s.ErrorContains(err, ErrMessageHistorySizeZero)
+}
+
+// TestApplyEvents_UnknownEventType verifies that an event type this build does not understand (such
+// as an event replicated from a newer server version) fails the rebuild instead of silently dropping
+// it and producing a mutable state that does not reflect the history.
+func (s *stateBuilderSuite) TestApplyEvents_UnknownEventType() {
+	unknownEvent := &historypb.HistoryEvent{
+		TaskId:    rand.Int63(),
+		Version:   1,
+		EventId:   130,
+		EventTime: timestamppb.New(time.Now().UTC()),
+		EventType: enumspb.EventType(99999),
+	}
+
+	s.mockMutableState.EXPECT().ClearStickyTaskQueue().AnyTimes()
+	s.mockMutableState.EXPECT().UpdateCurrentVersion(int64(1), true).AnyTimes()
+
+	_, err := s.stateRebuilder.ApplyEvents(
+		context.Background(),
+		tests.NamespaceID,
+		uuid.NewString(),
+		&commonpb.WorkflowExecution{WorkflowId: "some random workflow ID", RunId: tests.RunID},
+		s.toHistory(unknownEvent),
+		nil,
+		"",
+	)
+	var invalidArgument *serviceerror.InvalidArgument
+	s.ErrorAs(err, &invalidArgument)
+	s.ErrorContains(err, "Unknown event type")
+}
+
+// TestApplyEvents_ContinuedAsNew_NewRunIDMismatch verifies that a continued-as-new event whose new
+// run ID does not match the replication task is rejected rather than linking the wrong runs.
+func (s *stateBuilderSuite) TestApplyEvents_ContinuedAsNew_NewRunIDMismatch() {
+	continueAsNewEvent := &historypb.HistoryEvent{
+		TaskId:    rand.Int63(),
+		Version:   1,
+		EventId:   130,
+		EventTime: timestamppb.New(time.Now().UTC()),
+		EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_CONTINUED_AS_NEW,
+		Attributes: &historypb.HistoryEvent_WorkflowExecutionContinuedAsNewEventAttributes{WorkflowExecutionContinuedAsNewEventAttributes: &historypb.WorkflowExecutionContinuedAsNewEventAttributes{
+			NewExecutionRunId: "run-id-from-event",
+		}},
+	}
+
+	s.mockMutableState.EXPECT().ClearStickyTaskQueue().AnyTimes()
+	s.mockMutableState.EXPECT().UpdateCurrentVersion(int64(1), true).AnyTimes()
+
+	_, err := s.stateRebuilder.ApplyEvents(
+		context.Background(),
+		tests.NamespaceID,
+		uuid.NewString(),
+		&commonpb.WorkflowExecution{WorkflowId: "some random workflow ID", RunId: tests.RunID},
+		s.toHistory(continueAsNewEvent),
+		nil,
+		"run-id-from-task",
+	)
+	s.Error(err)
+	s.ErrorContains(err, "newRunID mismatch")
+}
+
+// TestApplyEvents_ContinuedAsNew_NewRunHistoryWithoutNewRunID verifies that new run history cannot
+// be rebuilt when neither the task nor the continued-as-new event carries the new run ID.
+func (s *stateBuilderSuite) TestApplyEvents_ContinuedAsNew_NewRunHistoryWithoutNewRunID() {
+	continueAsNewEvent := &historypb.HistoryEvent{
+		TaskId:    rand.Int63(),
+		Version:   1,
+		EventId:   130,
+		EventTime: timestamppb.New(time.Now().UTC()),
+		EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_CONTINUED_AS_NEW,
+		Attributes: &historypb.HistoryEvent_WorkflowExecutionContinuedAsNewEventAttributes{WorkflowExecutionContinuedAsNewEventAttributes: &historypb.WorkflowExecutionContinuedAsNewEventAttributes{
+			NewExecutionRunId: "",
+		}},
+	}
+	newRunStartedEvent := &historypb.HistoryEvent{
+		Version:   1,
+		EventId:   1,
+		EventTime: timestamppb.New(time.Now().UTC()),
+		EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
+		Attributes: &historypb.HistoryEvent_WorkflowExecutionStartedEventAttributes{WorkflowExecutionStartedEventAttributes: &historypb.WorkflowExecutionStartedEventAttributes{
+			TaskQueue:    &taskqueuepb.TaskQueue{Name: "some random taskqueue"},
+			WorkflowType: &commonpb.WorkflowType{Name: "some random workflow type"},
+		}},
+	}
+
+	s.mockMutableState.EXPECT().ClearStickyTaskQueue().AnyTimes()
+	s.mockMutableState.EXPECT().UpdateCurrentVersion(int64(1), true).AnyTimes()
+	s.mockMutableState.EXPECT().ApplyWorkflowExecutionContinuedAsNewEvent(
+		continueAsNewEvent.GetEventId(),
+		protomock.Eq(continueAsNewEvent),
+	).Return(nil)
+	s.mockTaskGenerator.EXPECT().GenerateWorkflowCloseTasks(
+		gomock.Any(),
+		false,
+		false,
+	).Return(nil)
+
+	_, err := s.stateRebuilder.ApplyEvents(
+		context.Background(),
+		tests.NamespaceID,
+		uuid.NewString(),
+		&commonpb.WorkflowExecution{WorkflowId: "some random workflow ID", RunId: tests.RunID},
+		s.toHistory(continueAsNewEvent),
+		[]*historypb.HistoryEvent{newRunStartedEvent},
+		"",
+	)
+	s.Error(err)
+	s.ErrorContains(err, "without new run ID")
+}
+
 func (s *stateBuilderSuite) TestApplyEvents_EventTypeWorkflowExecutionSignaled() {
 	version := int64(1)
 	requestID := uuid.NewString()

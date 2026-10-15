@@ -11,6 +11,7 @@ import (
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	historypb "go.temporal.io/api/history/v1"
+	"go.temporal.io/api/serviceerror"
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
 	historyspb "go.temporal.io/server/api/history/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
@@ -240,6 +241,108 @@ func (s *stateRebuilderSuite) TestPagination() {
 
 	s.Equal(expectedHistory, historyResult)
 	s.Equal(expectedTransactionIDs, transactionIDsResult)
+}
+
+func (s *stateRebuilderSuite) TestPagination_PartialReadMismatchedTransactionIDs() {
+	firstEventID := common.FirstEventID
+	nextEventID := int64(101)
+	branchToken := []byte("some random branch token")
+
+	event1 := &historypb.HistoryEvent{
+		EventId:   1,
+		EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
+		Attributes: &historypb.HistoryEvent_WorkflowExecutionStartedEventAttributes{WorkflowExecutionStartedEventAttributes: &historypb.WorkflowExecutionStartedEventAttributes{}},
+	}
+	history1 := []*historypb.History{{Events: []*historypb.HistoryEvent{event1}}}
+	history2 := []*historypb.History{{Events: []*historypb.HistoryEvent{event1}}}
+
+	s.mockExecutionManager.EXPECT().ReadHistoryBranchByBatch(gomock.Any(), &persistence.ReadHistoryBranchRequest{
+		BranchToken:   branchToken,
+		MinEventID:    firstEventID,
+		MaxEventID:    nextEventID,
+		PageSize:      defaultPageSize,
+		NextPageToken: nil,
+		ShardID:       s.mockShard.GetShardID(),
+	}).Return(&persistence.ReadHistoryBranchByBatchResponse{
+		History:        append(history1, history2...),
+		TransactionIDs: []int64{10},
+		NextPageToken:  nil,
+		Size:           12345,
+	}, nil)
+
+	paginationFn := s.nDCStateRebuilder.getPaginationFn(context.Background(), firstEventID, nextEventID, branchToken, tests.Namespace.String())
+	items, _, err := paginationFn(nil)
+	s.Error(err)
+	s.Nil(items)
+	s.ErrorContains(err, "partial history read")
+}
+
+func (s *stateRebuilderSuite) TestRebuild_CanceledContext() {
+	s.mockNamespaceCache.EXPECT().GetNamespaceByID(s.namespaceID).Return(tests.GlobalNamespaceEntry, nil).AnyTimes()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, _, err := s.nDCStateRebuilder.Rebuild(
+		ctx,
+		s.now,
+		definition.NewWorkflowKey(s.namespaceID.String(), s.workflowID, s.runID),
+		[]byte("some random branch token"),
+		2,
+		nil,
+		definition.NewWorkflowKey(s.namespaceID.String(), s.workflowID, s.runID),
+		[]byte("some random target branch token"),
+		uuid.NewString(),
+	)
+	s.ErrorIs(err, context.Canceled)
+}
+
+func (s *stateRebuilderSuite) TestRebuild_PaginationError() {
+	s.mockNamespaceCache.EXPECT().GetNamespaceByID(s.namespaceID).Return(tests.GlobalNamespaceEntry, nil).AnyTimes()
+
+	s.mockExecutionManager.EXPECT().ReadHistoryBranchByBatch(gomock.Any(), gomock.Any()).
+		Return(nil, context.Canceled)
+
+	_, _, err := s.nDCStateRebuilder.Rebuild(
+		context.Background(),
+		s.now,
+		definition.NewWorkflowKey(s.namespaceID.String(), s.workflowID, s.runID),
+		[]byte("some random branch token"),
+		2,
+		nil,
+		definition.NewWorkflowKey(s.namespaceID.String(), s.workflowID, s.runID),
+		[]byte("some random target branch token"),
+		uuid.NewString(),
+	)
+	s.ErrorIs(err, context.Canceled)
+}
+
+func (s *stateRebuilderSuite) TestRebuild_EmptyHistory() {
+	version := int64(12)
+	lastEventID := int64(2)
+	branchToken := []byte("some random branch token")
+
+	s.mockNamespaceCache.EXPECT().GetNamespaceByID(s.namespaceID).Return(tests.GlobalNamespaceEntry, nil).AnyTimes()
+	s.mockExecutionManager.EXPECT().ReadHistoryBranchByBatch(gomock.Any(), gomock.Any()).
+		Return(&persistence.ReadHistoryBranchByBatchResponse{
+			History:        nil,
+			TransactionIDs: nil,
+			NextPageToken:  nil,
+		}, nil)
+
+	_, _, err := s.nDCStateRebuilder.Rebuild(
+		context.Background(),
+		s.now,
+		definition.NewWorkflowKey(s.namespaceID.String(), s.workflowID, s.runID),
+		branchToken,
+		lastEventID,
+		new(version),
+		definition.NewWorkflowKey(s.namespaceID.String(), s.workflowID, s.runID),
+		branchToken,
+		uuid.NewString(),
+	)
+	var dataLoss *serviceerror.DataLoss
+	s.ErrorAs(err, &dataLoss)
 }
 
 func (s *stateRebuilderSuite) TestRebuild() {

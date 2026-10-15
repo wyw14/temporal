@@ -71,6 +71,59 @@ func (s *nDCEventReapplicationSuite) TearDownTest() {
 	s.controller.Finish()
 }
 
+// TestReapplyEvents_DuplicateDeliverySkipped verifies that redelivering an already-reapplied event
+// does not add it a second time or schedule another workflow task.
+func (s *nDCEventReapplicationSuite) TestReapplyEvents_DuplicateDeliverySkipped() {
+	runID := uuid.NewString()
+	event := &historypb.HistoryEvent{
+		EventId:   1,
+		Version:   1,
+		EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED,
+		Attributes: &historypb.HistoryEvent_WorkflowExecutionSignaledEventAttributes{WorkflowExecutionSignaledEventAttributes: &historypb.WorkflowExecutionSignaledEventAttributes{
+			Identity:   "test",
+			SignalName: "signal",
+			Input:      payloads.EncodeBytes([]byte{}),
+		}},
+	}
+
+	msCurrent := historyi.NewMockMutableState(s.controller)
+	msCurrent.EXPECT().VisitUpdates(gomock.Any()).Return()
+	msCurrent.EXPECT().GetCurrentVersion().Return(int64(0))
+	updateRegistry := update.NewRegistry(msCurrent)
+	msCurrent.EXPECT().IsWorkflowExecutionRunning().Return(true).Times(1)
+	msCurrent.EXPECT().HSM().Return(s.hsmNode).AnyTimes()
+	dedupResource := definition.NewEventReappliedID(runID, event.GetEventId(), event.GetVersion())
+	msCurrent.EXPECT().IsResourceDuplicated(dedupResource).Return(true)
+	msCurrent.EXPECT().AddWorkflowExecutionSignaled(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+	msCurrent.EXPECT().UpdateDuplicatedResource(gomock.Any()).Times(0)
+	msCurrent.EXPECT().AddWorkflowTaskScheduledEvent(gomock.Any(), gomock.Any()).Times(0)
+
+	appliedEvents, err := s.nDCReapplication.ReapplyEvents(context.Background(), msCurrent, updateRegistry, []*historypb.HistoryEvent{event}, runID)
+	s.NoError(err)
+	s.Nil(appliedEvents)
+}
+
+// TestReapplyEvents_UnknownEventTypeSkipped verifies that an event type neither framework knows
+// (such as an event from a newer server version) is skipped rather than failing the whole reapply
+// batch or corrupting mutable state.
+func (s *nDCEventReapplicationSuite) TestReapplyEvents_UnknownEventTypeSkipped() {
+	unknownEvent := &historypb.HistoryEvent{
+		EventId:   1,
+		Version:   1,
+		EventType: enumspb.EventType(99999),
+	}
+
+	msCurrent := historyi.NewMockMutableState(s.controller)
+	msCurrent.EXPECT().VisitUpdates(gomock.Any()).Return()
+	msCurrent.EXPECT().GetCurrentVersion().Return(int64(0))
+	updateRegistry := update.NewRegistry(msCurrent)
+	msCurrent.EXPECT().IsWorkflowExecutionRunning().Return(true).Times(1)
+
+	appliedEvents, err := s.nDCReapplication.ReapplyEvents(context.Background(), msCurrent, updateRegistry, []*historypb.HistoryEvent{unknownEvent}, "")
+	s.NoError(err)
+	s.Nil(appliedEvents)
+}
+
 func (s *nDCEventReapplicationSuite) TestReapplyEvents_AppliedEvent_WorkflowExecutionOptionsUpdated() {
 	runID := uuid.NewString()
 	execution := &persistencespb.WorkflowExecutionInfo{

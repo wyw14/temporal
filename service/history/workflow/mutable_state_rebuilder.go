@@ -78,6 +78,12 @@ func (b *MutableStateRebuilderImpl) ApplyEvents(
 	newRunHistory []*historypb.HistoryEvent,
 	newRunID string,
 ) (historyi.MutableState, error) {
+	if len(history) == 0 {
+		// A partial or empty history read must fail the rebuild instead of indexing history[-1] below
+		// and panicking the history shard with a partially built mutable state.
+		return nil, serviceerror.NewInternal(ErrMessageHistorySizeZero)
+	}
+
 	// Keep every persistence batch in this rebuild on the same backend if dynamic config changes mid-rebuild.
 	useChasmForNexus := b.useChasmForWorkflowNexusOperations()
 	chasmEnabled := b.mutableState.ChasmEnabled()
@@ -720,6 +726,12 @@ func (b *MutableStateRebuilderImpl) applyEvents(
 	// The length of newRunHistory can be zero in resend case
 	if len(newRunHistory) == 0 {
 		return nil, nil
+	}
+
+	if newRunID == "" {
+		// The continued-as-new close event carries the new run ID. Without it the new run would be
+		// rebuilt with an empty run ID, corrupting both runs' state, so fail the rebuild instead.
+		return nil, serviceerror.NewInternal("ApplyEvents encountered new run history without new run ID")
 	}
 
 	if b.mutableState.GetExecutionState().Status == enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING {

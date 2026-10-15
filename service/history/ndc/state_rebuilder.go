@@ -237,6 +237,10 @@ func (r *StateRebuilderImpl) buildMutableStateFromEvent(
 		return nil, 0, err
 	}
 
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
+
 	iter := collection.NewPagingIterator(r.getPaginationFn(
 		ctx,
 		common.FirstEventID,
@@ -251,8 +255,13 @@ func (r *StateRebuilderImpl) buildMutableStateFromEvent(
 		startTime,
 	)
 
+	replayedBatchCount := 0
 	var lastTxnId int64
 	for iter.HasNext() {
+		if err := ctx.Err(); err != nil {
+			// Replay cancellation must abort before more events touch the in-memory mutable state.
+			return nil, 0, err
+		}
 		history, err := iter.Next()
 		switch err.(type) {
 		case nil:
@@ -274,7 +283,16 @@ func (r *StateRebuilderImpl) buildMutableStateFromEvent(
 			return nil, 0, err
 		}
 
+		replayedBatchCount++
 		lastTxnId = history.TransactionID
+	}
+
+	if replayedBatchCount == 0 {
+		// The read succeeded but returned no history, meaning the branch is missing or only a partial
+		// history was read. Continuing would persist an empty mutable state, so report data loss.
+		dataLossErr := serviceerror.NewDataLoss("StateRebuilder encountered empty history when rebuilding mutable state")
+		r.logger.Error("encountered data loss event", tag.WorkflowNamespaceID(baseWorkflowIdentifier.NamespaceID), tag.WorkflowID(baseWorkflowIdentifier.WorkflowID), tag.WorkflowRunID(baseWorkflowIdentifier.RunID), tag.Error(dataLossErr))
+		return nil, 0, dataLossErr
 	}
 
 	if err := rebuiltMutableState.SetCurrentBranchToken(targetBranchToken); err != nil {
@@ -374,6 +392,15 @@ func (r *StateRebuilderImpl) getPaginationFn(
 		}
 
 		r.rebuiltHistorySize += int64(resp.Size)
+		if len(resp.TransactionIDs) != len(resp.History) {
+			// A partial read can desynchronize the two slices. Indexing TransactionIDs below would
+			// panic the shard, so surface the corrupted read as an error and abort the rebuild.
+			return nil, nil, serviceerror.NewInternalf(
+				"StateRebuilder encountered partial history read: %d history batches and %d transaction IDs",
+				len(resp.History),
+				len(resp.TransactionIDs),
+			)
+		}
 		paginateItems := make([]HistoryBlobsPaginationItem, 0, len(resp.History))
 		for i, history := range resp.History {
 			nextBatch := HistoryBlobsPaginationItem{
