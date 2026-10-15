@@ -668,6 +668,222 @@ func (s *MatcherDataSuite) TestReprocessTasks() {
 	s.Error(res.ctxErr)
 }
 
+// receiveResult reads from ch, failing the test after timeout if nothing arrives.
+func receiveResult(s *MatcherDataSuite, ch <-chan *matchResult, what string) *matchResult {
+	s.T().Helper()
+	select {
+	case res := <-ch:
+		return res
+	case <-time.After(time.Second):
+		s.Fail("timed out waiting for " + what)
+		return nil
+	}
+}
+
+func (s *MatcherDataSuite) TestMatchResultReasons() {
+	// long-poll deadline: timeout on the poller's own context
+	res := s.pollRealTime(time.Millisecond)
+	s.Require().ErrorIs(res.ctxErr, context.DeadlineExceeded)
+	s.Equal(matchResultTimeout, res.reason)
+	s.Equal(0, res.ctxErrIdx)
+
+	// worker brief disconnect: canceled before the deadline
+	pollCtx, cancelPoll := context.WithCancel(context.Background())
+	pollerCh := make(chan *matchResult, 1)
+	go func() { pollerCh <- s.pollContext(pollCtx, nil) }()
+	s.waitForPollers(1)
+	cancelPoll()
+	res = receiveResult(s, pollerCh, "canceled poller result")
+	s.Require().ErrorIs(res.ctxErr, context.Canceled)
+	s.Equal(matchResultCanceled, res.reason)
+
+	// match with a waiting long-poll worker
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		pollerCh <- s.pollContext(ctx, nil)
+	}()
+	s.waitForPollers(1)
+	task := s.newBacklogTask(1, 0, nil)
+	s.Require().NoError(s.md.EnqueueTaskNoWait(task))
+	res = receiveResult(s, pollerCh, "matched poller result")
+	s.Equal(matchResultMatched, res.reason)
+	s.Equal(task, res.task)
+	res.task.finish(taskFinishResult{consumedToken: true})
+
+	// versioning compatibility change: reprocess
+	s.Require().NoError(s.md.EnqueueTaskNoWait(s.newBacklogTask(2, 0, nil)))
+	reprocessed := s.md.ReprocessTasks(func(*internalTask) bool { return true })
+	s.Require().Len(reprocessed, 1)
+	s.Equal(matchResultReprocess, reprocessed[0].matchResult.reason)
+	s.ErrorIs(reprocessed[0].matchResult.ctxErr, errReprocessTask)
+}
+
+func (s *MatcherDataSuite) TestStopWakesWaitersWithStoppedReason() {
+	// A query-only poller cannot match the non-query task below, so both stay waiting.
+	pollerCh := make(chan *matchResult, 1)
+	go func() {
+		pollerCh <- s.md.EnqueuePollerAndWait(
+			[]context.Context{context.Background()},
+			&waitingPoller{
+				startTime:    s.now(),
+				queryOnly:    true,
+				forwardCtx:   context.Background(),
+				pollMetadata: &pollMetadata{},
+			},
+		)
+	}()
+	s.waitForPollers(1)
+
+	task := s.newSyncTask(nil)
+	taskCh := make(chan *matchResult, 1)
+	go func() { taskCh <- s.md.EnqueueTaskAndWait([]context.Context{context.Background()}, task) }()
+	s.waitForTasks(1)
+
+	s.md.Stop()
+
+	res := receiveResult(s, pollerCh, "poller result after Stop")
+	s.Equal(matchResultStopped, res.reason)
+	s.ErrorIs(res.ctxErr, errMatcherStopped)
+	res = receiveResult(s, taskCh, "task result after Stop")
+	s.Equal(matchResultStopped, res.reason)
+	s.ErrorIs(res.ctxErr, errMatcherStopped)
+
+	// Nothing new can enter the matcher after Stop.
+	s.ErrorIs(s.md.EnqueueTaskNoWait(s.newBacklogTask(9, 0, nil)), errMatcherStopped)
+	s.Equal(matchResultStopped, s.md.EnqueueTaskAndWait(nil, s.newSyncTask(nil)).reason)
+	s.Equal(matchResultStopped, s.md.EnqueuePollerAndWait(nil, &waitingPoller{startTime: s.now()}).reason)
+	s.Equal(syncMatchNoPoller, s.md.MatchTaskImmediately(s.newSyncTask(nil)))
+	s.Nil(s.md.MatchPollerImmediately(&waitingPoller{startTime: s.now()}))
+}
+
+func (s *MatcherDataSuite) TestStopKeepsBacklogTasksForReprocess() {
+	localTask := s.newBacklogTask(1, 0, nil)
+	redirectedTask := s.newBacklogTask(2, 0, nil)
+	redirectedTask.redirectedFromBacklog = true
+	s.Require().NoError(s.md.EnqueueTaskNoWait(localTask))
+	s.Require().NoError(s.md.EnqueueTaskNoWait(redirectedTask))
+
+	// A waiting sync task is woken by Stop and removed from the matcher.
+	syncTask := s.newSyncTask(nil)
+	taskCh := make(chan *matchResult, 1)
+	go func() { taskCh <- s.md.EnqueueTaskAndWait([]context.Context{context.Background()}, syncTask) }()
+	s.waitForTasks(3)
+
+	s.md.Stop()
+	res := receiveResult(s, taskCh, "sync task result after Stop")
+	s.Equal(matchResultStopped, res.reason)
+
+	// Backlog tasks have no waiter. They stay in the stopped matcher so that
+	// ReprocessRedirectedTasksAfterStop can send redirected tasks back to their origin.
+	reprocessed := s.md.ReprocessTasks(func(*internalTask) bool { return true })
+	s.ElementsMatch([]*internalTask{localTask, redirectedTask}, reprocessed)
+}
+
+// TestPollForwardHalfMatchDeliveryOnce covers a poller that is half-matched with a poll
+// forwarder while its worker briefly disconnects. The started task that comes back from
+// the remote partition must be delivered to that poller at most once.
+func (s *MatcherDataSuite) TestPollForwardHalfMatchDeliveryOnce() {
+	newHalfMatchedPoller := func() (*waitingPoller, context.CancelFunc, <-chan *matchResult) {
+		pollCtx, cancel := context.WithCancel(context.Background())
+		poller := &waitingPoller{
+			startTime:    s.now(),
+			forwardCtx:   pollCtx,
+			pollMetadata: &pollMetadata{},
+		}
+		pollerCh := make(chan *matchResult, 1)
+		go func() { pollerCh <- s.md.EnqueuePollerAndWait([]context.Context{pollCtx}, poller) }()
+		s.waitForPollers(1)
+
+		fwdCh := make(chan *matchResult, 1)
+		go func() {
+			fwdCh <- s.md.EnqueueTaskAndWait(nil, newPollForwarderTask(pollForwarderPriority, parentPollForwarder))
+		}()
+		fwdRes := receiveResult(s, fwdCh, "poll forwarder half-match")
+		s.Require().NotNil(fwdRes.poller)
+		s.Same(poller, fwdRes.poller)
+		return poller, cancel, pollerCh
+	}
+	newStartedTask := func() *internalTask {
+		return newInternalStartedTask(&startedTaskInfo{})
+	}
+
+	s.Run("DisconnectBeforeForwardReturns", func() {
+		poller, cancelPoll, pollerCh := newHalfMatchedPoller()
+
+		// Worker briefly disconnects while the forwarded poll is in flight.
+		cancelPoll()
+		res := receiveResult(s, pollerCh, "poller result after disconnect")
+		s.Equal(matchResultCanceled, res.reason)
+		s.Nil(res.task)
+
+		// The remote partition returns a task that it already marked started. It must not
+		// be delivered to the disconnected poller, and a second call must not either.
+		started := newStartedTask()
+		s.False(s.md.FinishMatchAfterPollForward(poller, started))
+		s.False(s.md.FinishMatchAfterPollForward(poller, started))
+		// Re-enqueueing must not resurrect or redeliver the poller.
+		s.md.ReenqueuePollerIfNotMatched(poller)
+	})
+
+	s.Run("ForwardReturnsBeforeDisconnect", func() {
+		poller, cancelPoll, pollerCh := newHalfMatchedPoller()
+
+		started := newStartedTask()
+		s.True(s.md.FinishMatchAfterPollForward(poller, started))
+		// A second delivery attempt is refused: the task is assigned exactly once.
+		s.False(s.md.FinishMatchAfterPollForward(poller, newStartedTask()))
+
+		// Disconnect arriving after delivery does not change the match result.
+		cancelPoll()
+		res := receiveResult(s, pollerCh, "poller result after delivery")
+		s.Equal(matchResultMatched, res.reason)
+		s.Same(started, res.task)
+		s.md.ReenqueuePollerIfNotMatched(poller)
+	})
+}
+
+func (s *MatcherDataSuite) TestReenqueueAfterStopWakesPoller() {
+	// Half-match a poller with a poll forwarder, then stop the matcher before the forward
+	// returns: re-enqueueing the poller must resolve it as stopped instead of dispatching
+	// a backlog task through a stopping matcher.
+	pollCtx, cancelPoll := context.WithCancel(context.Background())
+	defer cancelPoll()
+	poller := &waitingPoller{
+		startTime:    s.now(),
+		forwardCtx:   pollCtx,
+		pollMetadata: &pollMetadata{},
+	}
+	pollerCh := make(chan *matchResult, 1)
+	go func() { pollerCh <- s.md.EnqueuePollerAndWait([]context.Context{pollCtx}, poller) }()
+	s.waitForPollers(1)
+
+	fwdCh := make(chan *matchResult, 1)
+	go func() {
+		fwdCh <- s.md.EnqueueTaskAndWait(nil, newPollForwarderTask(pollForwarderPriority, parentPollForwarder))
+	}()
+	fwdRes := receiveResult(s, fwdCh, "poll forwarder half-match")
+	s.Require().NotNil(fwdRes.poller)
+
+	// A backlog task arrives while the poll is being forwarded. It must not be given to
+	// the poller when the poller is re-enqueued after Stop.
+	backlogTask := s.newBacklogTask(1, 0, nil)
+	s.Require().NoError(s.md.EnqueueTaskNoWait(backlogTask))
+
+	s.md.Stop()
+	s.md.ReenqueuePollerIfNotMatched(poller)
+
+	res := receiveResult(s, pollerCh, "poller result after Stop and re-enqueue")
+	s.Equal(matchResultStopped, res.reason)
+	s.Nil(res.task)
+
+	// The undispatched backlog task is still in the matcher for the post-stop sweep.
+	s.ElementsMatch(
+		[]*internalTask{backlogTask},
+		s.md.ReprocessTasks(func(*internalTask) bool { return true }),
+	)
+}
+
 func (s *MatcherDataSuite) TestMinPriorityFiltering() {
 	// Add tasks at different priorities
 	t1 := s.newBacklogTaskWithPriority(1, 0, nil, &commonpb.Priority{PriorityKey: 1})

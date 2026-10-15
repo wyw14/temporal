@@ -566,3 +566,103 @@ func (s *PriMatcherSuite) TestChildBacklogForwarding() {
 		})
 	}
 }
+
+// TestStopInterruptsLongPoll verifies that stopping the matcher (task queue unload or
+// matcher restart) ends a blocked long poll immediately, even if the matcher's task queue
+// context is not canceled until later by the physical task queue manager.
+func (s *PriMatcherSuite) TestStopInterruptsLongPoll() {
+	// Keep the matcher's tqCtx alive past tm.Stop to prove that Stop itself resolves the
+	// poll with the stopped reason instead of relying on context cancellation.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	tm := s.newTestMatcher(ctx, testMatcherOpts{})
+	tm.Start()
+
+	type pollResult struct {
+		task *internalTask
+		err  error
+	}
+	pollCh := make(chan pollResult, 1)
+	go func() {
+		t, err := tm.Poll(context.Background(), &pollMetadata{})
+		pollCh <- pollResult{t, err}
+	}()
+
+	require.Eventually(s.T(), tm.HasWaitingPoller, time.Second, time.Millisecond)
+
+	tm.Stop()
+
+	select {
+	case res := <-pollCh:
+		require.Nil(s.T(), res.task)
+		require.ErrorIs(s.T(), res.err, errNoTasks)
+	case <-time.After(2 * time.Second):
+		s.Fail("long poll was not interrupted when the matcher stopped")
+	}
+}
+
+// TestPollCanceledBeforeMatchDoesNotDispatch pairs a worker disconnect with a task that
+// arrives just afterward: the disconnected poller must not receive the task, and the task
+// must stay queued for the next poller (assigned exactly once).
+func (s *PriMatcherSuite) TestPollCanceledBeforeMatchDoesNotDispatch() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	tm := s.newTestMatcher(ctx, testMatcherOpts{})
+	tm.Start()
+	defer tm.Stop()
+
+	pollCtx, cancelPoll := context.WithCancel(context.Background())
+	pollCh := make(chan error, 1)
+	go func() {
+		_, err := tm.Poll(pollCtx, &pollMetadata{})
+		pollCh <- err
+	}()
+
+	require.Eventually(s.T(), tm.HasWaitingPoller, time.Second, time.Millisecond)
+
+	// Worker briefly disconnects.
+	cancelPoll()
+	select {
+	case err := <-pollCh:
+		require.ErrorIs(s.T(), err, errNoTasks)
+	case <-time.After(2 * time.Second):
+		s.Fail("canceled poll did not return")
+	}
+
+	// A new long-poll worker arrives and waits. Local pollers are matched before the
+	// root validator, so queueing it before the task makes the assignment deterministic.
+	type pollResult struct {
+		task *internalTask
+		err  error
+	}
+	taskCh := make(chan pollResult, 1)
+	go func() {
+		t, err := tm.Poll(context.Background(), &pollMetadata{})
+		taskCh <- pollResult{t, err}
+	}()
+	require.Eventually(s.T(), tm.HasWaitingPoller, time.Second, time.Millisecond)
+
+	// The task is assigned once, to the new poller rather than to the disconnected one.
+	task := newTestBacklogTask(0, func(*internalTask, taskResponse) {})
+	task.resetMatcherState()
+	require.NoError(s.T(), tm.AddTask(task))
+
+	select {
+	case res := <-taskCh:
+		require.NoError(s.T(), res.err)
+		require.Same(s.T(), task, res.task)
+	case <-time.After(2 * time.Second):
+		s.Fail("new poller did not receive the task")
+	}
+	require.False(s.T(), matcherHasTask(tm, task), "task must be removed from the matcher after dispatch")
+}
+
+// matcherHasTask reports whether task is currently queued in the matcher.
+func matcherHasTask(tm *priTaskMatcher, task *internalTask) bool {
+	tm.data.lock.Lock()
+	defer tm.data.lock.Unlock()
+	_, ok := tm.data.tasks.tree.Get(task)
+	return ok
+}

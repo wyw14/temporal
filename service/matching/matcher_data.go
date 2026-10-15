@@ -2,6 +2,7 @@ package matching
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 	"unsafe"
@@ -43,6 +44,54 @@ const (
 	// A poller was available but rate limiting blocked the match.
 	syncMatchRateLimited
 )
+
+// matchResultReason says why a waiting task or poller stopped waiting. It lets callers
+// tell apart, without inspecting errors and context indices, the outcomes that matter:
+// dispatch to a long-poll worker, a versioning reprocess, context timeout/cancellation,
+// and matcher shutdown.
+type matchResultReason int8
+
+const (
+	// Default zero value; should not be used explicitly.
+	matchResultUnspecified matchResultReason = iota
+	// The wait ended in a match: task and poller were paired for dispatch.
+	matchResultMatched
+	// A context deadline expired: a poller's long poll timed out or a task offer expired.
+	matchResultTimeout
+	// A context was canceled before its deadline: the worker went away or the caller
+	// canceled the offer. The matched object was not dispatched.
+	matchResultCanceled
+	// User data changed and versioning decisions must be re-evaluated. Only tasks can
+	// receive this result; they are reprocessed rather than dispatched.
+	matchResultReprocess
+	// The matcher was stopped (task queue unload/restart). Waiters must not continue
+	// matching or forwarding.
+	matchResultStopped
+)
+
+// matchResultReasonForError classifies a matchResult error into a reason. A nil error
+// yields matchResultUnspecified: a match carries no terminal error.
+func matchResultReasonForError(err error) matchResultReason {
+	if err == nil {
+		return matchResultUnspecified
+	}
+	switch {
+	case errors.Is(err, errReprocessTask):
+		return matchResultReprocess
+	case errors.Is(err, errMatcherStopped):
+		return matchResultStopped
+	case errors.Is(err, context.DeadlineExceeded):
+		return matchResultTimeout
+	default:
+		// Any other cancellation is a plain context cancellation (worker disconnect,
+		// canceled offer, or task queue context closing).
+		return matchResultCanceled
+	}
+}
+
+func stoppedMatchResult() *matchResult {
+	return &matchResult{reason: matchResultStopped, ctxErr: errMatcherStopped, ctxErrIdx: -1}
+}
 
 type taskForwarderType int32
 
@@ -248,11 +297,47 @@ func newMatcherData(config *taskQueueConfig, logger log.Logger, timeSource clock
 	}
 }
 
+// Stop marks the matcher as stopped and wakes every waiter with matchResultStopped so
+// that tasks and polls do not wait for the task queue context to be canceled. The wake
+// reason distinguishes a matcher restart/unload from a long-poll timeout or a worker
+// disconnect. Backlog tasks without a waiter are left in the tree: they are dropped with
+// the matcher or returned to their origin queue by ReprocessTasks after Stop.
 func (d *matcherData) Stop() {
 	d.lock.Lock()
 	defer d.lock.Unlock()
 
+	if d.stopped {
+		return
+	}
 	d.stopped = true
+
+	d.rateLimitTimer.unset()
+	d.reconsiderForwardTimer.unset()
+
+	res := stoppedMatchResult()
+
+	// Wake every waiting poller, including task forwarders and the root validator.
+	for poller := d.pollers.head; poller != nil; {
+		next := poller.next
+		d.pollers.Remove(poller)
+		poller.wake(d.logger, res)
+		poller = next
+	}
+
+	// Wake tasks that have waiters: sync-match tasks (history offers, queries, nexus
+	// tasks) and poll forwarder pseudo-tasks. Backlog tasks have no waiter and stay in
+	// the tree for the post-stop reprocess sweep.
+	var waitingTasks []*internalTask
+	d.tasks.tree.Scan(func(task *internalTask) bool {
+		if task.isSyncMatchTask() || task.isPollForwarder() {
+			waitingTasks = append(waitingTasks, task)
+		}
+		return true
+	})
+	for _, task := range waitingTasks {
+		d.tasks.Remove(task)
+		task.wake(d.logger, res)
+	}
 }
 
 func (d *matcherData) EnqueueTaskNoWait(task *internalTask) error {
@@ -282,6 +367,10 @@ func (d *matcherData) EnqueueTaskAndWait(ctxs []context.Context, task *internalT
 	d.lock.Lock()
 	defer d.lock.Unlock()
 
+	if d.stopped {
+		return stoppedMatchResult()
+	}
+
 	// add and look for match
 	task.initMatch(d)
 	d.tasks.Add(task)
@@ -300,7 +389,12 @@ func (d *matcherData) EnqueueTaskAndWait(ctxs []context.Context, task *internalT
 
 			if task.matchResult == nil {
 				d.tasks.Remove(task)
-				task.wake(d.logger, &matchResult{ctxErr: ctx.Err(), ctxErrIdx: i})
+				err := ctx.Err()
+				task.wake(d.logger, &matchResult{
+					reason:    matchResultReasonForError(err),
+					ctxErr:    err,
+					ctxErrIdx: i,
+				})
 			}
 		})
 		defer stop() // nolint:revive // there's only ever a small number of contexts
@@ -313,15 +407,27 @@ func (d *matcherData) ReenqueuePollerIfNotMatched(poller *waitingPoller) {
 	d.lock.Lock()
 	defer d.lock.Unlock()
 
-	if poller.matchResult == nil {
-		d.pollers.Add(poller)
-		d.findAndWakeMatches()
+	if poller.matchResult != nil {
+		return
 	}
+	if d.stopped {
+		// The forwarded poll failed while the matcher was restarting. Do not re-enqueue
+		// (which could dispatch a backlog task through a stopping matcher); resolve the
+		// poller with the stopped reason instead.
+		poller.wake(d.logger, stoppedMatchResult())
+		return
+	}
+	d.pollers.Add(poller)
+	d.findAndWakeMatches()
 }
 
 func (d *matcherData) EnqueuePollerAndWait(ctxs []context.Context, poller *waitingPoller) *matchResult {
 	d.lock.Lock()
 	defer d.lock.Unlock()
+
+	if d.stopped {
+		return stoppedMatchResult()
+	}
 
 	// update this for timeSinceLastPoll
 	d.lastPoller = util.MaxTime(d.lastPoller, poller.startTime)
@@ -348,7 +454,12 @@ func (d *matcherData) EnqueuePollerAndWait(ctxs []context.Context, poller *waiti
 				if poller.queued {
 					d.pollers.Remove(poller)
 				}
-				poller.wake(d.logger, &matchResult{ctxErr: ctx.Err(), ctxErrIdx: i})
+				err := ctx.Err()
+				poller.wake(d.logger, &matchResult{
+					reason:    matchResultReasonForError(err),
+					ctxErr:    err,
+					ctxErrIdx: i,
+				})
 			}
 		})
 		defer stop() // nolint:revive // there's only ever a small number of contexts
@@ -361,6 +472,12 @@ func (d *matcherData) EnqueuePollerAndWait(ctxs []context.Context, poller *waiti
 func (d *matcherData) MatchTaskImmediately(task *internalTask) syncMatchOutcome {
 	d.lock.Lock()
 	defer d.lock.Unlock()
+
+	// A stopped matcher cannot dispatch; the caller should spool the task so it is
+	// re-read after the matcher restarts.
+	if d.stopped {
+		return syncMatchNoPoller
+	}
 
 	if !d.isBacklogNegligible() {
 		// To ensure better dispatch ordering, we block sync match when a significant backlog is present.
@@ -389,6 +506,11 @@ func (d *matcherData) MatchPollerImmediately(poller *waitingPoller) *matchResult
 	d.lock.Lock()
 	defer d.lock.Unlock()
 
+	// nil means "no task available", same as an empty no-wait poll.
+	if d.stopped {
+		return nil
+	}
+
 	poller.initMatch(d)
 	d.pollers.Add(poller)
 	d.findAndWakeMatches()
@@ -408,9 +530,13 @@ func (d *matcherData) ReprocessTasks(pred func(*internalTask) bool) []*internalT
 	d.tasks.ForEachTask(
 		pred,
 		func(task *internalTask) {
-			// for sync tasks: wake up waiters with a fake context error
+			// for sync tasks: wake up waiters with the reprocess reason
 			// for backlog tasks: the caller should call finish()
-			task.wake(d.logger, &matchResult{ctxErr: errReprocessTask, ctxErrIdx: -1})
+			task.wake(d.logger, &matchResult{
+				reason:    matchResultReprocess,
+				ctxErr:    errReprocessTask,
+				ctxErrIdx: -1,
+			})
 			reprocess = append(reprocess, task)
 		},
 	)
@@ -529,6 +655,12 @@ func (d *matcherData) allowForwarding() (allowForwarding bool) {
 
 // call with lock held. Returns true if a match was found but blocked by rate limiting.
 func (d *matcherData) findAndWakeMatches() (rateLimited bool) {
+	// A stopped matcher must not start any new dispatch: waiters have been woken with
+	// matchResultStopped and remaining tasks are dropped or reprocessed after Stop.
+	if d.stopped {
+		return false
+	}
+
 	allowForwarding := d.canForward && d.allowForwarding()
 
 	now := d.timeSource.Now().UnixNano()
@@ -555,9 +687,9 @@ func (d *matcherData) findAndWakeMatches() (rateLimited bool) {
 		d.rateLimitManager.consumeTokens(now, task, 1)
 		task.recycleToken = d.recycleToken
 
-		res := &matchResult{task: task, poller: poller}
+		res := &matchResult{reason: matchResultMatched, task: task, poller: poller}
 		task.wake(d.logger, res)
-		// for poll forwarder: skip waking poller, forwarder will call finishMatchAfterPollForward
+		// for poll forwarder: skip waking poller, forwarder will call FinishMatchAfterPollForward
 		if !task.isPollForwarder() {
 			poller.wake(d.logger, res)
 		}
@@ -584,13 +716,21 @@ func (d *matcherData) rematchAfterTimer() {
 	d.findAndWakeMatches()
 }
 
-func (d *matcherData) FinishMatchAfterPollForward(poller *waitingPoller, task *internalTask) {
+// FinishMatchAfterPollForward completes the half-match between a poller and a poll
+// forwarder after the forwarded poll returned a task. It returns true if the task was
+// handed to the poller, false if the poller was already resolved (for example its worker
+// disconnected or the matcher stopped while the forward was in flight). A false result
+// means the task, which the remote partition has already marked started, is delivered to
+// no one and must not be finished or delivered a second time.
+func (d *matcherData) FinishMatchAfterPollForward(poller *waitingPoller, task *internalTask) bool {
 	d.lock.Lock()
 	defer d.lock.Unlock()
 
-	if poller.matchResult == nil {
-		poller.wake(d.logger, &matchResult{task: task, poller: poller})
+	if poller.matchResult != nil {
+		return false
 	}
+	poller.wake(d.logger, &matchResult{reason: matchResultMatched, task: task, poller: poller})
+	return true
 }
 
 // isBacklogNegligible returns true if the age of the task backlog is less than the threshold.

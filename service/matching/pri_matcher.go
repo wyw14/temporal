@@ -60,10 +60,18 @@ type waitingPoller struct {
 }
 
 type matchResult struct {
-	task      *internalTask
-	poller    *waitingPoller
-	ctxErr    error // set if context timed out/canceled or reprocess task
-	ctxErrIdx int   // index of context that closed first
+	task   *internalTask
+	poller *waitingPoller
+	// reason classifies how the wait ended: match with a long-poll worker, timeout,
+	// worker cancellation, versioning reprocess, or matcher stop.
+	reason    matchResultReason
+	ctxErr    error // set unless reason is matchResultMatched; carries the concrete error
+	ctxErrIdx int   // index of context that closed first (-1 when not caused by a context)
+}
+
+// matched reports whether the result pairs a task with a poller.
+func (r *matchResult) matched() bool {
+	return r.reason == matchResultMatched
 }
 
 // remotePriorityBacklog represents the fact that a specific normal partition has a significant
@@ -177,8 +185,8 @@ func (tm *priTaskMatcher) forwardTasks(lim quotas.RateLimiter, retrier backoff.R
 		}
 
 		res := tm.data.EnqueuePollerAndWait(ctxs, &poller)
-		if res.ctxErr != nil {
-			return // task queue closing
+		if !res.matched() {
+			return // task queue closing or stopped
 		}
 		if !softassert.That(tm.logger, res.task != nil, "expected a task from match") {
 			continue
@@ -252,8 +260,8 @@ func (tm *priTaskMatcher) validateTasksOnRoot(retrier backoff.Retrier) {
 	poller := &waitingPoller{taskForwarderType: validatorTaskForwarder}
 	for {
 		res := tm.data.EnqueuePollerAndWait(ctxs, poller)
-		if res.ctxErr != nil {
-			return // task queue closing
+		if !res.matched() {
+			return // task queue closing or stopped
 		}
 		if !softassert.That(tm.logger, res.task != nil, "expected a task from match") {
 			continue
@@ -305,8 +313,8 @@ func (tm *priTaskMatcher) forwardPolls(
 		}
 
 		res := tm.data.EnqueueTaskAndWait(ctxs, forwarderTask)
-		if res.ctxErr != nil {
-			return // task queue closing
+		if !res.matched() {
+			return // task queue closing or stopped
 		}
 		if !softassert.That(tm.logger, res.poller != nil, "expected a poller from match") {
 			continue
@@ -333,10 +341,17 @@ func (tm *priTaskMatcher) forwardPolls(
 		cancel()
 		_ = stop()
 		if err == nil {
-			tm.data.FinishMatchAfterPollForward(poller, task)
 			retrier.Reset()
-			if ft == priorityBacklogPollForwarder {
-				metrics.PriorityBacklogForwardedPerTaskQueueCounter.With(tm.metricsHandler).Record(1)
+			if tm.data.FinishMatchAfterPollForward(poller, task) {
+				if ft == priorityBacklogPollForwarder {
+					metrics.PriorityBacklogForwardedPerTaskQueueCounter.With(tm.metricsHandler).Record(1)
+				}
+			} else {
+				// The poller was resolved while the forwarded poll was in flight: its worker
+				// briefly disconnected or the matcher stopped. The remote partition already
+				// marked this task started in history, so it must not be dispatched again.
+				// History times the task out and schedules a retry.
+				tm.logger.Debug("started task from forwarded poll dropped because poller is gone")
 			}
 		} else if ft == priorityBacklogPollForwarder && errors.Is(err, errNoTasks) {
 			// There are no tasks of the priority we're looking for on the target. This goroutine
@@ -433,7 +448,10 @@ func (tm *priTaskMatcher) Offer(ctx context.Context, task *internalTask) (syncMa
 	}
 
 	res := tm.data.EnqueueTaskAndWait([]context.Context{ctx, tm.tqCtx}, task)
-	if res.ctxErr != nil {
+	if !res.matched() {
+		// No dispatch: offer timed out or was canceled (no poller), versioning requires
+		// a reprocess, or the matcher is restarting. The concrete error tells the caller
+		// which one it is (e.g. errReprocessTask triggers re-routing).
 		return syncMatchNoPoller, res.ctxErr
 	}
 	if !softassert.That(tm.logger, res.poller != nil, "expeced poller from match") {
@@ -638,11 +656,24 @@ func (tm *priTaskMatcher) poll(
 	if res == nil {
 		pollResult = "timeout"
 		return nil, errNoTasks // only possible for MatchPollerImmediately
-	} else if res.ctxErr != nil {
-		if res.ctxErrIdx == 0 {
-			metrics.PollTimeoutPerTaskQueueCounter.With(tm.metricsHandler).Record(1)
+	}
+	if !res.matched() {
+		// Distinguish the ways a long poll can end without a task so they are separable
+		// in metrics: long-poll deadline, worker disconnect, and matcher restart/unload.
+		switch res.reason {
+		case matchResultTimeout:
+			pollResult = "timeout"
+			if res.ctxErrIdx == 0 {
+				metrics.PollTimeoutPerTaskQueueCounter.With(tm.metricsHandler).Record(1)
+			}
+		case matchResultCanceled:
+			// The worker went away before the long-poll deadline expired.
+			pollResult = "canceled"
+		case matchResultStopped:
+			pollResult = "stopped"
+		default:
+			pollResult = "failed"
 		}
-		pollResult = "timeout"
 		return nil, errNoTasks
 	}
 
