@@ -625,6 +625,126 @@ func TestRecordHeartbeatMetrics(t *testing.T) {
 	}
 }
 
+// TestRecordHeartbeatDuplicateAndTerminalRejection covers the network-jitter and termination
+// edges of the worker -> server heartbeat path:
+//   - duplicate/redelivered heartbeat RPCs are accepted idempotently (latest progress wins) and
+//     each re-arms the heartbeat timeout timer;
+//   - once the execution is terminated, all worker commands carrying the old task token
+//     (heartbeat/complete/fail/cancel) are rejected with NotFound, so a lingering worker can
+//     neither keep the old activity alive nor recreate timers.
+func TestRecordHeartbeatDuplicateAndTerminalRejection(t *testing.T) {
+	testTime := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+	const (
+		namespaceID = "test-namespace-id"
+		activityID  = "test-activity-id"
+		runID       = "test-run-id"
+		attempt     = int32(1)
+		stamp       = int32(7)
+	)
+
+	componentRef, err := (&persistencespb.ChasmComponentRef{
+		NamespaceId: namespaceID,
+		BusinessId:  activityID,
+		RunId:       runID,
+	}).Marshal()
+	require.NoError(t, err)
+
+	ctx := &chasm.MockMutableContext{
+		MockContext: chasm.MockContext{
+			HandleNow: func(chasm.Component) time.Time { return testTime },
+			HandleExecutionKey: func() chasm.ExecutionKey {
+				return chasm.ExecutionKey{NamespaceID: namespaceID, BusinessID: activityID, RunID: runID}
+			},
+		},
+	}
+
+	act := &Activity{
+		ActivityState: &activitypb.ActivityState{
+			Status:           activitypb.ACTIVITY_EXECUTION_STATUS_STARTED,
+			HeartbeatTimeout: durationpb.New(time.Minute),
+		},
+		LastAttempt: chasm.NewDataField(ctx, &activitypb.ActivityAttemptState{
+			Count:        attempt,
+			Stamp:        stamp,
+			StartedStamp: stamp,
+		}),
+	}
+	token := &tokenspb.Task{
+		NamespaceId:          namespaceID,
+		Attempt:              attempt,
+		ComponentRef:         componentRef,
+		ActivityAttemptStamp: stamp,
+	}
+	heartbeatRequest := func(data string) WithToken[*historyservice.RecordActivityTaskHeartbeatRequest] {
+		return WithToken[*historyservice.RecordActivityTaskHeartbeatRequest]{
+			Token: token,
+			Request: &historyservice.RecordActivityTaskHeartbeatRequest{
+				NamespaceId: namespaceID,
+				HeartbeatRequest: &workflowservice.RecordActivityTaskHeartbeatRequest{
+					Details: &commonpb.Payloads{Payloads: []*commonpb.Payload{{Data: []byte(data)}}},
+				},
+			},
+		}
+	}
+	heartbeatTimeoutTaskCount := func() int {
+		count := 0
+		for _, addedTask := range ctx.Tasks {
+			if _, ok := addedTask.Payload.(*activitypb.HeartbeatTimeoutTask); ok {
+				count++
+			}
+		}
+		return count
+	}
+	var notFoundErr *serviceerror.NotFound
+
+	resp, err := act.RecordHeartbeat(ctx, heartbeatRequest("first"))
+	require.NoError(t, err)
+	require.False(t, resp.GetCancelRequested())
+	require.False(t, resp.GetActivityPaused())
+	require.False(t, resp.GetActivityReset())
+	require.Equal(t, int64(1), act.LastHeartbeat.Get(ctx).GetTotalHeartbeatCount())
+	require.Equal(t, 1, heartbeatTimeoutTaskCount())
+
+	// Duplicate delivery (e.g. gRPC retry after a network hiccup): accepted, latest details win.
+	_, err = act.RecordHeartbeat(ctx, heartbeatRequest("second"))
+	require.NoError(t, err)
+	require.Equal(t, int64(2), act.LastHeartbeat.Get(ctx).GetTotalHeartbeatCount())
+	require.Equal(t, []byte("second"), act.LastHeartbeat.Get(ctx).GetDetails().GetPayloads()[0].GetData())
+	require.Equal(t, testTime, act.LastHeartbeat.Get(ctx).GetRecordedTime().AsTime())
+	require.Equal(t, 2, heartbeatTimeoutTaskCount())
+
+	// Terminate the execution. The old worker must be fully cut off.
+	act.Status = activitypb.ACTIVITY_EXECUTION_STATUS_TERMINATED
+
+	_, err = act.RecordHeartbeat(ctx, heartbeatRequest("third"))
+	require.ErrorAs(t, err, &notFoundErr)
+	require.Equal(t, 2, heartbeatTimeoutTaskCount(), "rejected heartbeat must not arm a timer")
+
+	_, err = act.HandleCompleted(ctx, RespondCompletedEvent{
+		Token:   token,
+		Request: &historyservice.RespondActivityTaskCompletedRequest{NamespaceId: namespaceID},
+	})
+	require.ErrorAs(t, err, &notFoundErr)
+
+	_, err = act.HandleFailed(ctx, RespondFailedEvent{
+		Token: token,
+		Request: &historyservice.RespondActivityTaskFailedRequest{
+			NamespaceId:   namespaceID,
+			FailedRequest: &workflowservice.RespondActivityTaskFailedRequest{},
+		},
+	})
+	require.ErrorAs(t, err, &notFoundErr)
+
+	_, err = act.HandleCanceled(ctx, RespondCancelledEvent{
+		Token: token,
+		Request: &historyservice.RespondActivityTaskCanceledRequest{
+			NamespaceId:   namespaceID,
+			CancelRequest: &workflowservice.RespondActivityTaskCanceledRequest{},
+		},
+	})
+	require.ErrorAs(t, err, &notFoundErr)
+}
+
 func TestActivityTaskTokenAttemptStampRejectsTokenFromBeforeAttemptReset(t *testing.T) {
 	testTime := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
 	const (

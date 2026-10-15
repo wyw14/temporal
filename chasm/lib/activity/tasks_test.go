@@ -279,6 +279,33 @@ func TestActivityIsDispatchTaskValid(t *testing.T) {
 			stamp:  currentStamp,
 			valid:  false,
 		},
+		// A terminated/closed execution must never dispatch an activity task, even when the
+		// persisted task carries the current attempt stamp (e.g. a retry dispatch in flight when
+		// the execution was terminated).
+		{
+			name:   "canceled",
+			status: activitypb.ACTIVITY_EXECUTION_STATUS_CANCELED,
+			stamp:  currentStamp,
+			valid:  false,
+		},
+		{
+			name:   "failed",
+			status: activitypb.ACTIVITY_EXECUTION_STATUS_FAILED,
+			stamp:  currentStamp,
+			valid:  false,
+		},
+		{
+			name:   "timed out",
+			status: activitypb.ACTIVITY_EXECUTION_STATUS_TIMED_OUT,
+			stamp:  currentStamp,
+			valid:  false,
+		},
+		{
+			name:   "terminated",
+			status: activitypb.ACTIVITY_EXECUTION_STATUS_TERMINATED,
+			stamp:  currentStamp,
+			valid:  false,
+		},
 	}
 
 	for _, tc := range testCases {
@@ -402,6 +429,18 @@ func TestTimeoutTaskTerminalFailure(t *testing.T) {
 			expectedRetryState:  enumspb.RETRY_STATE_CANCEL_REQUESTED,
 		},
 		{
+			// A worker that stops heartbeating after cancellation was requested must close as
+			// CANCEL_REQUESTED rather than be rescheduled by the server: worker-driven cancellation
+			// takes precedence over server-side retry even though the triggering timer is a
+			// heartbeat timeout.
+			name:                "heartbeat cancellation requested",
+			timeoutType:         enumspb.TIMEOUT_TYPE_HEARTBEAT,
+			startStatus:         activitypb.ACTIVITY_EXECUTION_STATUS_CANCEL_REQUESTED,
+			scheduleToClose:     time.Minute,
+			expectedTimeoutType: enumspb.TIMEOUT_TYPE_HEARTBEAT,
+			expectedRetryState:  enumspb.RETRY_STATE_CANCEL_REQUESTED,
+		},
+		{
 			name:                "schedule to close cancellation requested",
 			timeoutType:         enumspb.TIMEOUT_TYPE_SCHEDULE_TO_CLOSE,
 			startStatus:         activitypb.ACTIVITY_EXECUTION_STATUS_CANCEL_REQUESTED,
@@ -501,3 +540,249 @@ func TestTimeoutTaskTerminalFailure(t *testing.T) {
 		})
 	}
 }
+
+// TestHeartbeatTimeoutTaskValidate covers the coordination between worker heartbeats and the
+// heartbeat timeout timer:
+//   - a timer for which no newer heartbeat arrived (including the initial timer anchored at the
+//     attempt start) is valid;
+//   - a heartbeat arriving after the timer was scheduled invalidates it, so a late/out-of-order
+//     timer delivery (network jitter) can no longer time out a live attempt;
+//   - the check is based on the timer's persisted scheduled time, not wall-clock time, so it
+//     stays deterministic on shard restart / catch-up replay;
+//   - timers from an old attempt stamp (server already rescheduled) and timers of closed
+//     executions are discarded;
+//   - the timer keeps firing while the worker still owns the token under a cancel/pause/reset
+//     request, so a worker that goes silent is still reaped.
+func TestHeartbeatTimeoutTaskValidate(t *testing.T) {
+	const (
+		currentAttemptStamp int32 = 1
+		hbTimeout                 = 10 * time.Second
+	)
+	startedAt := defaultTime
+	handler := newHeartbeatTimeoutTaskHandler()
+
+	type testCase struct {
+		name          string
+		status        activitypb.ActivityExecutionStatus
+		attemptStamp  int32
+		lastHeartbeat *time.Time
+		// taskScheduledTime is the persisted scheduled time carried by the timer task (hb_i + T).
+		taskScheduledTime time.Time
+		// now is wall-clock time at validation. Validation must not depend on it.
+		now          time.Time
+		wantValid    bool
+	}
+	hbTime := func(offset time.Duration) time.Time { return startedAt.Add(offset) }
+
+	testCases := []testCase{
+		{
+			name:              "initial heartbeat timer valid without any heartbeat",
+			status:            activitypb.ACTIVITY_EXECUTION_STATUS_STARTED,
+			attemptStamp:      currentAttemptStamp,
+			taskScheduledTime: hbTime(hbTimeout),
+			now:               hbTime(hbTimeout),
+			wantValid:         true,
+		},
+		{
+			name:              "newer heartbeat invalidates the initial timer",
+			status:            activitypb.ACTIVITY_EXECUTION_STATUS_STARTED,
+			attemptStamp:      currentAttemptStamp,
+			lastHeartbeat:     ptr(hbTime(6 * time.Second)),
+			taskScheduledTime: hbTime(hbTimeout),
+			now:               hbTime(hbTimeout),
+			wantValid:         false,
+		},
+		{
+			name:              "heartbeat exactly at the timer threshold keeps it valid",
+			status:            activitypb.ACTIVITY_EXECUTION_STATUS_STARTED,
+			attemptStamp:      currentAttemptStamp,
+			lastHeartbeat:     ptr(hbTime(6 * time.Second)),
+			taskScheduledTime: hbTime(16 * time.Second),
+			now:               hbTime(16 * time.Second),
+			wantValid:         true,
+		},
+		{
+			name:              "stale attempt stamp discarded after server-side reschedule",
+			status:            activitypb.ACTIVITY_EXECUTION_STATUS_STARTED,
+			attemptStamp:      currentAttemptStamp + 1,
+			lastHeartbeat:     ptr(hbTime(6 * time.Second)),
+			taskScheduledTime: hbTime(hbTimeout),
+			now:               hbTime(hbTimeout),
+			wantValid:         false,
+		},
+		{
+			name:              "cancel requested timer still enforced while worker holds the token",
+			status:            activitypb.ACTIVITY_EXECUTION_STATUS_CANCEL_REQUESTED,
+			attemptStamp:      currentAttemptStamp,
+			lastHeartbeat:     ptr(hbTime(6 * time.Second)),
+			taskScheduledTime: hbTime(16 * time.Second),
+			now:               hbTime(16 * time.Second),
+			wantValid:         true,
+		},
+		{
+			name:              "pause requested timer still enforced",
+			status:            activitypb.ACTIVITY_EXECUTION_STATUS_PAUSE_REQUESTED,
+			attemptStamp:      currentAttemptStamp,
+			lastHeartbeat:     ptr(hbTime(6 * time.Second)),
+			taskScheduledTime: hbTime(16 * time.Second),
+			now:               hbTime(16 * time.Second),
+			wantValid:         true,
+		},
+		{
+			name:              "reset requested timer still enforced",
+			status:            activitypb.ACTIVITY_EXECUTION_STATUS_RESET_REQUESTED,
+			attemptStamp:      currentAttemptStamp,
+			lastHeartbeat:     ptr(hbTime(6 * time.Second)),
+			taskScheduledTime: hbTime(16 * time.Second),
+			now:               hbTime(16 * time.Second),
+			wantValid:         true,
+		},
+		{
+			name:              "closed execution timer discarded",
+			status:            activitypb.ACTIVITY_EXECUTION_STATUS_TIMED_OUT,
+			attemptStamp:      currentAttemptStamp,
+			lastHeartbeat:     ptr(hbTime(6 * time.Second)),
+			taskScheduledTime: hbTime(16 * time.Second),
+			now:               hbTime(16 * time.Second),
+			wantValid:         false,
+		},
+		{
+			// Process restart: the task fires long after its persisted scheduled time. The
+			// decision must still be derived from persisted heartbeat state only.
+			name:              "restart catch-up replays against persisted scheduled time",
+			status:            activitypb.ACTIVITY_EXECUTION_STATUS_STARTED,
+			attemptStamp:      currentAttemptStamp,
+			lastHeartbeat:     ptr(hbTime(6 * time.Second)),
+			taskScheduledTime: hbTime(16 * time.Second),
+			now:               hbTime(time.Hour),
+			wantValid:         true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := &chasm.MockMutableContext{
+				MockContext: chasm.MockContext{
+					HandleNow: func(chasm.Component) time.Time { return tc.now },
+				},
+			}
+			activity := &Activity{
+				ActivityState: &activitypb.ActivityState{
+					Status:           tc.status,
+					HeartbeatTimeout: durationpb.New(hbTimeout),
+				},
+				LastAttempt: chasm.NewDataField(ctx, &activitypb.ActivityAttemptState{
+					Count:        1,
+					Stamp:        tc.attemptStamp,
+					StartedStamp: tc.attemptStamp,
+					StartedTime:  timestamppb.New(startedAt),
+				}),
+			}
+			if tc.lastHeartbeat != nil {
+				activity.LastHeartbeat = chasm.NewDataField(ctx, &activitypb.ActivityHeartbeatState{
+					RecordedTime: timestamppb.New(*tc.lastHeartbeat),
+				})
+			}
+
+			valid, err := handler.Validate(
+				ctx,
+				activity,
+				chasm.TaskInvocation{TaskAttributes: chasm.TaskAttributes{ScheduledTime: tc.taskScheduledTime}},
+				&activitypb.HeartbeatTimeoutTask{Stamp: currentAttemptStamp},
+			)
+			require.NoError(t, err)
+			require.Equal(t, tc.wantValid, valid)
+		})
+	}
+}
+
+// TestHeartbeatTimeoutReschedulesAndDuplicateTaskDropped verifies that a heartbeat timeout with
+// retries left is a server-side reschedule (attempt and stamp bumped, retry dispatch emitted, no
+// terminal outcome), and that the duplicate heartbeat-timeout tasks persisted by repeated
+// heartbeats all become no-ops once the first one reschedules the attempt.
+func TestHeartbeatTimeoutReschedulesAndDuplicateTaskDropped(t *testing.T) {
+	metricsHandler := metricstest.NewCaptureHandler()
+	capture := metricsHandler.StartCapture()
+	defer metricsHandler.StopCapture(capture)
+
+	ctx := &chasm.MockMutableContext{
+		MockContext: chasm.MockContext{
+			HandleNow:            func(chasm.Component) time.Time { return defaultTime.Add(1500 * time.Millisecond) },
+			HandleMetricsHandler: func() metrics.Handler { return metricsHandler },
+			HandleNamespaceEntry: testNamespaceEntry,
+			GoCtx: context.WithValue(context.Background(), ctxKeyActivityContext, &activityContext{
+				config: &Config{
+					BreakdownMetricsByTaskQueue:              dynamicconfig.GetBoolPropertyFnFilteredByTaskQueue(false),
+					MutableStateActivityFailureSizeLimitError: dynamicconfig.GetIntPropertyFnFilteredByNamespace(defaultFailureSizeLimit),
+				},
+			}),
+		},
+	}
+
+	const stamp int32 = 1
+	activity := &Activity{
+		ActivityState: &activitypb.ActivityState{
+			ActivityType: &commonpb.ActivityType{Name: "test-activity-type"},
+			TaskQueue:    &taskqueuepb.TaskQueue{Name: "test-task-queue"},
+			RetryPolicy: &commonpb.RetryPolicy{
+				InitialInterval:    durationpb.New(time.Second),
+				BackoffCoefficient: 1,
+				MaximumAttempts:    5,
+			},
+			ScheduleTime:           timestamppb.New(defaultTime),
+			ScheduleToCloseTimeout: durationpb.New(10 * time.Minute),
+			Status:                 activitypb.ACTIVITY_EXECUTION_STATUS_STARTED,
+		},
+		LastAttempt: chasm.NewDataField(ctx, &activitypb.ActivityAttemptState{
+			Count:       1,
+			Stamp:       stamp,
+			StartedStamp: stamp,
+			StartedTime: timestamppb.New(defaultTime),
+		}),
+		Outcome:       chasm.NewDataField(ctx, &activitypb.ActivityOutcome{}),
+		LastHeartbeat: chasm.NewDataField(ctx, &activitypb.ActivityHeartbeatState{}),
+	}
+
+	task := &activitypb.HeartbeatTimeoutTask{Stamp: stamp}
+	err := newHeartbeatTimeoutTaskHandler().Execute(ctx, activity, chasm.TaskAttributes{}, task)
+	require.NoError(t, err)
+
+	// Server-side retry, not a terminal outcome.
+	require.Equal(t, activitypb.ACTIVITY_EXECUTION_STATUS_SCHEDULED, activity.GetStatus())
+	attempt := activity.LastAttempt.Get(ctx)
+	require.Equal(t, int32(2), attempt.GetCount())
+	require.Equal(t, stamp+1, attempt.GetStamp())
+	require.NotNil(t, attempt.GetCompleteTime())
+	require.Equal(t, time.Second, attempt.GetCurrentRetryInterval().AsDuration())
+	require.Nil(t, activity.Outcome.Get(ctx).GetVariant())
+	require.Equal(t, enumspb.TIMEOUT_TYPE_HEARTBEAT,
+		attempt.GetLastFailureDetails().GetFailure().GetTimeoutFailureInfo().GetTimeoutType())
+
+	// A retry dispatch for the new attempt must have been scheduled with the new stamp.
+	var dispatchTask *activitypb.ActivityDispatchTask
+	for _, addedTask := range ctx.Tasks {
+		if t, ok := addedTask.Payload.(*activitypb.ActivityDispatchTask); ok {
+			dispatchTask = t
+		}
+	}
+	require.NotNil(t, dispatchTask)
+	require.Equal(t, activitypb.DISPATCH_REASON_RETRY, dispatchTask.GetDispatchReason())
+	require.Equal(t, stamp+1, dispatchTask.GetStamp())
+
+	// Duplicate heartbeat-timeout tasks (e.g. repeated heartbeats before the timeout, or
+	// transaction retries) must all be discarded now.
+	valid, err := newHeartbeatTimeoutTaskHandler().Validate(
+		ctx,
+		activity,
+		chasm.TaskInvocation{TaskAttributes: chasm.TaskAttributes{ScheduledTime: defaultTime.Add(1500 * time.Millisecond)}},
+		task,
+	)
+	require.NoError(t, err)
+	require.False(t, valid)
+
+	recordings := capture.Snapshot()[metrics.ActivityTaskTimeout.Name()]
+	require.Len(t, recordings, 1)
+	require.Equal(t, enumspb.TIMEOUT_TYPE_HEARTBEAT.String(), recordings[0].Tags["timeout_type"])
+}
+
+func ptr[T any](v T) *T { return &v }

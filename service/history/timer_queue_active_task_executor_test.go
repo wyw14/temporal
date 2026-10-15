@@ -1517,6 +1517,89 @@ func (s *timerQueueActiveTaskExecutorSuite) TestActivityRetryTimer_Noop() {
 	s.ErrorIs(resp.ExecutionErr, consts.ErrActivityTaskNotFound)
 }
 
+func (s *timerQueueActiveTaskExecutorSuite) TestActivityRetryTimer_WorkflowCompleted() {
+	execution := &commonpb.WorkflowExecution{
+		WorkflowId: "some random workflow ID",
+		RunId:      uuid.NewString(),
+	}
+	workflowType := "some random workflow type"
+	taskQueueName := "some random task queue"
+
+	mutableState := workflow.TestGlobalMutableState(s.mockShard, s.mockShard.GetEventsCache(), s.logger, s.version, execution.GetWorkflowId(), execution.GetRunId())
+	_, err := mutableState.AddWorkflowExecutionStartedEvent(
+		execution,
+		&historyservice.StartWorkflowExecutionRequest{
+			Attempt:     1,
+			NamespaceId: s.namespaceID.String(),
+			StartRequest: &workflowservice.StartWorkflowExecutionRequest{
+				WorkflowType: &commonpb.WorkflowType{Name: workflowType},
+				TaskQueue: &taskqueuepb.TaskQueue{
+					Name: taskQueueName,
+					Kind: enumspb.TASK_QUEUE_KIND_NORMAL,
+				},
+				WorkflowRunTimeout:  durationpb.New(200 * time.Second),
+				WorkflowTaskTimeout: durationpb.New(1 * time.Second),
+			},
+		},
+	)
+	s.NoError(err)
+
+	wt := addWorkflowTaskScheduledEvent(mutableState)
+	event := addWorkflowTaskStartedEvent(mutableState, wt.ScheduledEventID, taskQueueName, uuid.NewString())
+	wt.StartedEventID = event.GetEventId()
+	event = addWorkflowTaskCompletedEvent(&s.Suite, mutableState, wt.ScheduledEventID, wt.StartedEventID, "some random identity")
+
+	activityID := "activity"
+	activityType := "activity type"
+	timerTimeout := 2 * time.Second
+	_, activityInfo := addActivityTaskScheduledEventWithRetry(
+		mutableState,
+		event.GetEventId(),
+		activityID,
+		activityType,
+		taskQueueName,
+		nil,
+		timerTimeout,
+		timerTimeout,
+		timerTimeout,
+		timerTimeout,
+		&commonpb.RetryPolicy{
+			InitialInterval:        durationpb.New(1 * time.Second),
+			BackoffCoefficient:     1.2,
+			MaximumInterval:        durationpb.New(5 * time.Second),
+			MaximumAttempts:        5,
+			NonRetryableErrorTypes: []string{"（╯' - ')╯ ┻━┻ "},
+		},
+	)
+	activityInfo.Attempt = 1
+
+	timerTask := &tasks.ActivityRetryTimerTask{
+		WorkflowKey: definition.NewWorkflowKey(
+			s.namespaceID.String(),
+			execution.GetWorkflowId(),
+			execution.GetRunId(),
+		),
+		Version:             s.version,
+		TaskID:              s.mustGenerateTaskID(),
+		VisibilityTimestamp: s.now,
+		EventID:             activityInfo.ScheduledEventId,
+		Attempt:             activityInfo.Attempt,
+		Stamp:               activityInfo.Stamp,
+	}
+
+	// The workflow is terminated while the activity is waiting for the server-side retry timer.
+	terminatedEvent, err := mutableState.AddWorkflowExecutionTerminatedEvent("terminated", nil, "tester", false, nil)
+	s.NoError(err)
+
+	persistenceMutableState := s.createPersistenceMutableState(mutableState, terminatedEvent.GetEventId(), terminatedEvent.GetVersion())
+	s.mockExecutionMgr.EXPECT().GetWorkflowExecution(gomock.Any(), gomock.Any()).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
+	// No Matching AddActivityTask expectation: the retry of the old activity must not be
+	// dispatched after workflow termination.
+
+	resp := s.timerQueueActiveTaskExecutor.Execute(context.Background(), s.newTaskExecutable(timerTask))
+	s.ErrorIs(resp.ExecutionErr, consts.ErrWorkflowCompleted)
+}
+
 func (s *timerQueueActiveTaskExecutorSuite) TestWorkflowRunTimeout_Fire() {
 	execution := &commonpb.WorkflowExecution{
 		WorkflowId: "some random workflow ID",
